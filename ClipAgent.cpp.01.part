@@ -1,0 +1,761 @@
+// ClipAgent.cpp part 01 -- includes, globals, prototypes, utilities.
+// ASCII only. // comments only. No C4819 triggers.
+// Merged with parts 02/03/04 into one translation unit.
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+// winsock2 MUST precede windows.h or the old winsock.h wins.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <restartmanager.h>
+#include <strsafe.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+
+#include "ClipProtocol.h"
+#include "miniz.h"
+
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "User32.lib")
+#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Rstrtmgr.lib")
+#pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "Advapi32.lib")
+
+// ---- ui / timer ids, shared by parts 03 and 04 ----
+#define WM_APP_TRAY        (WM_APP + 1)
+#define WM_APP_CHOICE      (WM_APP + 2)
+#define WM_APP_PROGRESS    (WM_APP + 3)
+#define ID_TRAY_ICON       1
+#define IDM_PASTE          1001
+#define IDM_CANCEL         1002
+#define IDM_RESUME         1003
+#define IDM_OPEN_OUTDIR    1004
+#define IDM_SHOW_LOG       1005
+#define IDM_EXIT           1006
+#define HOTKEY_PASTE       1
+#define HOTKEY_CANCEL      2
+#define HOTKEY_LOG         3
+#define IDT_CHOICE         4
+#define IDT_SWEEP          5
+#define IDT_PROGRESS       6
+#define CLIP_WND_CLASS     "ClipAgentHiddenWnd"
+
+// ---- log levels ----
+#define LOG_INFO  0
+#define LOG_OK    1
+#define LOG_WARN  2
+#define LOG_ERR   3
+
+// ---- pseudo error for a clean peer close ----
+#define CLIP_NET_CLOSED    0xFFFFFFF0u
+#define CLIP_MAX_TEXT_WCH  524288
+#define CLIP_MAX_DEPTH     32
+#define CLIP_MAX_PATHS     4096
+
+// ---- one global context. Every cross-thread field is volatile. ----
+typedef struct _CLIP_CTX {
+    SOCKET            sock;
+    CLIP_STATE        state;
+    volatile LONG     abort;
+    volatile LONG     netRunning;
+    volatile LONG     uiRunning;
+
+    char              key[CLIP_KEY_MAX];
+    ULONG             keyTag;
+    char              peerHost[128];
+    USHORT            port;
+    BOOL              isHost;
+    BOOL              quiet;
+
+    WCHAR             outDir[MAX_PATH];
+    WCHAR             tempDir[MAX_PATH];
+    ULONG             maxFileMb;
+    ULONG             confirmMb;
+
+    HINSTANCE         hInst;
+    HWND              hwnd;
+    HWND              hwndDlg;
+    DWORD             uiThreadId;
+    HANDLE            hNetThread;
+    CRITICAL_SECTION  logLock;
+    NOTIFYICONDATAW   nid;
+    BOOL              trayAdded;
+    BOOL              consoleShown;
+    HANDLE            hConsole;
+
+    // advert state: paths and text only, NEVER file content
+    WCHAR**           pendingPaths;
+    ULONG             pendingCount;
+    ULONG             pendingCap;
+    WCHAR*            pendingText;
+    ULONGLONG         pendingTextBytes;
+    ULONGLONG         pendingClipSeq;
+    CLIP_LIST         pendingList;
+
+    // transfer state
+    CLIPZIP           zip;
+    WCHAR             zipTemp[MAX_PATH];
+    WCHAR             cdTemp[MAX_PATH];
+    WCHAR             partPath[MAX_PATH];
+    WCHAR             finalPath[MAX_PATH];
+    HANDLE            hPart;
+    ULONGLONG         requestId;
+    ULONGLONG         bytesTotal;
+    ULONGLONG         bytesDone;
+    ULONGLONG         blockSeq;
+    ULONG             wholeCrc;
+    BOOL              textMode;      // FRAME_ZIP_START.FileName[0] == 0
+    DWORD             lastErr;
+
+    // pause / skip
+    CLIP_PAUSE        pauseInfo;
+    DWORD             pauseTick;
+    char              skipComment[CLIPZIP_MAX_COMMENT];
+    ULONG             skipCount;
+} CLIP_CTX;
+
+static CLIP_CTX g;
+
+// ============================================================
+// Forward declarations for parts 02 / 03 / 04.
+// Kept here so any part may call any other part after merging.
+// ============================================================
+
+// part 02: state machine, cleanup, interruption
+VOID     TransferSetState(CLIP_STATE st);
+VOID     CleanupTransfer(CLIP_REASON reason, BOOL keepPartial);
+VOID     TransferRequestAbort(VOID);
+BOOL     TransferIsAborted(VOID);
+VOID     SweepStaleFiles(BOOL atStartup);
+VOID     PauseTransfer(const CLIP_PAUSE* p);
+BOOL     ResumeTransfer(ULONG action);
+VOID     HandleDisconnect(DWORD err);
+
+// part 03: owner lookup, error split, front end
+BOOL     UiInit(HINSTANCE hInst);
+VOID     UiShutdown(VOID);
+VOID     TrayBalloon(const char* title, const char* text, DWORD flags);
+VOID     TraySetTip(const char* tip);
+BOOL     UiRegisterHotKeys(VOID);
+VOID     UiShowLog(BOOL show);
+LRESULT CALLBACK HiddenWndProc(HWND h, UINT m, WPARAM w, LPARAM l);
+ULONG    ClipQueryOwnerProcesses(const WCHAR* path, char* out, ULONG cap);
+ULONG    ClipClassifyAndReport(const WCHAR* subject, DWORD err,
+                              char* out, ULONG cap);
+ULONG    AskUserChoice(const char* prompt);
+BOOL     ClipGetForegroundDir(WCHAR* out, ULONG cap);
+BOOL     ClipCheckDiskSpace(const WCHAR* dir, ULONGLONG need);
+VOID     ClipShowSkipList(const char* comment);
+
+// part 04: wire dispatch, streaming, entry point
+DWORD WINAPI NetThread(LPVOID p);
+BOOL     HandleFrame(const CLIP_FRAME_HEADER* h, const BYTE* payload);
+BOOL     HandlePull(const CLIP_PULL* p);
+BOOL     BuildAndSendPayload(ULONGLONG requestId, BOOL resume);
+BOOL     ReceiverBegin(const CLIP_ZIP_START* s);
+BOOL     ReceiverWriteChunk(ULONGLONG seq, const BYTE* p, ULONG n);
+BOOL     ReceiverFinish(const CLIP_ZIP_END* e);
+BOOL     ParseArgs(int argc, WCHAR** argv);
+
+// part 01 utilities
+VOID     Log(ULONG level, const char* fmt, ...);
+char*    W2A(const WCHAR* w);
+WCHAR*   A2W(const char* a);
+VOID     FreeBuf(void* p, ULONG n);
+VOID     ClipFormatBytes(ULONGLONG n, char* out, ULONG cap);
+ULONG    FrameCrc(const BYTE* p, ULONG n);
+BOOL     NetSendFrame(USHORT type, ULONGLONG seq,
+                      const void* payload, ULONG len, PDWORD pdwErr);
+int      NetRecvFrame(CLIP_FRAME_HEADER* h, BYTE* payload, ULONG cap,
+                      PULONG pLen, PDWORD pdwErr);
+BOOL     ClipSanitizeName(const WCHAR* raw, WCHAR* out, ULONG cap,
+                          ULONGLONG seq);
+BOOL     ClipMakeTempName(WCHAR* out, ULONG cap, const WCHAR* suffix,
+                          ULONGLONG seq);
+BOOL     ClipMakePartName(const WCHAR* finalName, WCHAR* out, ULONG cap);
+BOOL     ClipEnsureDir(const WCHAR* dir);
+VOID     ClipDeleteIfExists(const WCHAR* path);
+VOID     ClipZeroAndFree(void* p, ULONG n);
+BOOL     ClipGetDropPaths(WCHAR*** pPaths, PULONG pCount);
+BOOL     ClipGetUnicodeText(WCHAR** pText, PULONGLONG pBytes);
+BOOL     ClipSetUnicodeText(const WCHAR* text);
+BOOL     ClipCalcTotal(WCHAR** paths, ULONG count, PULONGLONG pTotal,
+                       PULONGLONG pLargest, PULONG pFiles, PULONG pDirs);
+VOID     PendingClear(VOID);
+BOOL     PendingEnsure(ULONG need);
+
+// ============================================================
+// Log: timestamped console line + tray balloon on error.
+// Console text is ASCII only on purpose (C4819 avoidance).
+// ============================================================
+VOID Log(ULONG level, const char* fmt, ...)
+{
+    char        body[1024];
+    char        line[1200];
+    SYSTEMTIME  st;
+    va_list     ap;
+    CONSOLE_SCREEN_BUFFER_INFO cbi;
+    WORD        attr = 0, old = 0;
+    BOOL        recol = FALSE;
+
+    va_start(ap, fmt);
+    StringCchVPrintfA(body, 1024, fmt, ap);
+    va_end(ap);
+
+    GetLocalTime(&st);
+    StringCchPrintfA(line, 1200, "[%02u:%02u:%02u] %s\n",
+                     st.wHour, st.wMinute, st.wSecond, body);
+
+    EnterCriticalSection(&g.logLock);
+    if (!g.quiet && g.hConsole) {
+        if (GetConsoleScreenBufferInfo(g.hConsole, &cbi)) {
+            old = cbi.wAttributes;
+            switch (level) {
+            case LOG_OK:   attr = FOREGROUND_GREEN | FOREGROUND_INTENSITY; break;
+            case LOG_WARN: attr = FOREGROUND_RED | FOREGROUND_GREEN |
+                                 FOREGROUND_INTENSITY; break;
+            case LOG_ERR:  attr = FOREGROUND_RED | FOREGROUND_INTENSITY; break;
+            default:       attr = old; break;
+            }
+            SetConsoleTextAttribute(g.hConsole, attr);
+            recol = TRUE;
+        }
+        WriteConsoleA(g.hConsole, line, (DWORD)lstrlenA(line), NULL, NULL);
+        if (recol) SetConsoleTextAttribute(g.hConsole, old);
+    }
+    LeaveCriticalSection(&g.logLock);
+
+    if (level >= LOG_ERR && g.trayAdded)
+        TrayBalloon("ClipAgent", body, 0x00000001);
+}
+
+// ============================================================
+// Small string helpers. Every buffer is zeroed before free.
+// ============================================================
+char* W2A(const WCHAR* w)
+{
+    int   n;
+    char* p;
+    n = WideCharToMultiByte(CP_ACP, 0, w ? w : L"", -1, NULL, 0, NULL, NULL);
+    if (n <= 0) n = 1;
+    p = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (SIZE_T)n + 1);
+    if (!p) return NULL;
+    if (w) WideCharToMultiByte(CP_ACP, 0, w, -1, p, n, NULL, NULL);
+    p[n] = '\0';
+    return p;
+}
+
+WCHAR* A2W(const char* a)
+{
+    int    n;
+    WCHAR* p;
+    n = MultiByteToWideChar(CP_ACP, 0, a ? a : "", -1, NULL, 0);
+    if (n <= 0) n = 1;
+    p = (WCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                          ((SIZE_T)n + 1) * sizeof(WCHAR));
+    if (!p) return NULL;
+    if (a) MultiByteToWideChar(CP_ACP, 0, a, -1, p, n);
+    p[n] = L'\0';
+    return p;
+}
+
+VOID FreeBuf(void* p, ULONG n)
+{
+    if (!p) return;
+    if (n) ZeroMemory(p, n);
+    HeapFree(GetProcessHeap(), 0, p);
+}
+
+VOID ClipZeroAndFree(void* p, ULONG n)
+{
+    FreeBuf(p, n);
+}
+
+VOID ClipFormatBytes(ULONGLONG n, char* out, ULONG cap)
+{
+    double v = (double)n;
+    if (n < 1024ull)
+        StringCchPrintfA(out, cap, "%I64u B", n);
+    else if (n < 1024ull * 1024ull)
+        StringCchPrintfA(out, cap, "%.1f KB", v / 1024.0);
+    else if (n < 1024ull * 1024ull * 1024ull)
+        StringCchPrintfA(out, cap, "%.1f MB", v / 1048576.0);
+    else
+        StringCchPrintfA(out, cap, "%.2f GB", v / 1073741824.0);
+}
+
+// ============================================================
+// Frame CRC: standard IEEE result, seed 0xFFFFFFFF, final invert.
+// Same arithmetic as the ZIP entries in miniz.c.
+// ============================================================
+ULONG FrameCrc(const BYTE* p, ULONG n)
+{
+    return ~ClipCrc32(0xFFFFFFFFu, p, n);
+}
+
+static int SockSendAll(SOCKET s, const BYTE* p, ULONG n, PDWORD pdwErr)
+{
+    ULONG left = n;
+    while (left) {
+        int k = send(s, (const char*)p, (int)left, 0);
+        if (k == SOCKET_ERROR) { *pdwErr = (DWORD)WSAGetLastError(); return 0; }
+        if (k == 0)           { *pdwErr = CLIP_NET_CLOSED;          return 0; }
+        p    += k;
+        left -= (ULONG)k;
+    }
+    return 1;
+}
+
+static int SockRecvAll(SOCKET s, BYTE* p, ULONG n, PDWORD pdwErr)
+{
+    ULONG left = n;
+    while (left) {
+        int k = recv(s, (char*)p, (int)left, 0);
+        if (k == SOCKET_ERROR) { *pdwErr = (DWORD)WSAGetLastError(); return 0; }
+        if (k == 0)           { *pdwErr = CLIP_NET_CLOSED;          return 0; }
+        p    += k;
+        left -= (ULONG)k;
+    }
+    return 1;
+}
+
+// Both ends are x64 little-endian Windows. Structs go raw, no hton*.
+BOOL NetSendFrame(USHORT type, ULONGLONG seq,
+                  const void* payload, ULONG len, PDWORD pdwErr)
+{
+    CLIP_FRAME_HEADER h;
+    DWORD e = ERROR_SUCCESS;
+
+    if (pdwErr) *pdwErr = ERROR_SUCCESS;
+    if (g.sock == INVALID_SOCKET || len > CLIP_MAX_FRAME_PAYLOAD) {
+        if (pdwErr) *pdwErr = ERROR_INVALID_PARAMETER;
+        return FALSE;
+    }
+
+    ZeroMemory(&h, sizeof(h));
+    h.Magic   = CLIP_FRAME_MAGIC;
+    h.Version = (USHORT)CLIP_PROTO_VERSION;
+    h.Type    = type;
+    h.KeyTag  = g.keyTag;
+    h.Seq     = seq;
+    h.Length  = len;
+    h.Crc32   = FrameCrc((const BYTE*)payload, len);
+
+    if (!SockSendAll(g.sock, (const BYTE*)&h, sizeof(h), &e)) goto fail;
+    if (len && !SockSendAll(g.sock, (const BYTE*)payload, len, &e)) goto fail;
+    return TRUE;
+
+fail:
+    if (pdwErr) *pdwErr = e;
+    return FALSE;
+}
+
+// returns 1 = frame ok, 0 = error (pdwErr), -1 = peer closed
+int NetRecvFrame(CLIP_FRAME_HEADER* h, BYTE* payload, ULONG cap,
+                 PULONG pLen, PDWORD pdwErr)
+{
+    DWORD e = ERROR_SUCCESS;
+    ZeroMemory(h, sizeof(*h));
+    if (pLen)  *pLen  = 0;
+    if (pdwErr) *pdwErr = ERROR_SUCCESS;
+
+    if (!SockRecvAll(g.sock, (BYTE*)h, sizeof(*h), &e)) {
+        if (pdwErr) *pdwErr = e;
+        return (e == CLIP_NET_CLOSED) ? -1 : 0;
+    }
+    if (h->Magic != CLIP_FRAME_MAGIC) {
+        if (pdwErr) *pdwErr = ERROR_INVALID_DATA; return 0;
+    }
+    if (h->Version != CLIP_PROTO_VERSION) {
+        if (pdwErr) *pdwErr = ERROR_NOT_SUPPORTED; return 0;
+    }
+    if (h->KeyTag != g.keyTag) {
+        if (pdwErr) *pdwErr = ERROR_ACCESS_DENIED; return 0;
+    }
+    if (h->Length > cap || h->Length > CLIP_MAX_FRAME_PAYLOAD) {
+        if (pdwErr) *pdwErr = ERROR_INVALID_DATA; return 0;
+    }
+    if (h->Length && !SockRecvAll(g.sock, payload, h->Length, &e)) {
+        if (pdwErr) *pdwErr = e;
+        return (e == CLIP_NET_CLOSED) ? -1 : 0;
+    }
+    if (FrameCrc(payload, h->Length) != h->Crc32) {
+        if (pdwErr) *pdwErr = ERROR_CRC; return 0;
+    }
+    if (pLen) *pLen = h->Length;
+    return 1;
+}
+
+// ============================================================
+// Name sanitation. Six rules agreed before this part:
+//  1  strip  \ / : * ? " < > |  and 0x00-0x1F
+//  2  take basename after the last '\' OR '/'  (zip entries use '/')
+//  3  ':' removal also kills NTFS alternate data streams
+//  4  trim leading/trailing spaces, trailing dots; prefix reserved devices
+//  5  '.' '..' and empty -> clip_<seq>
+//  6  truncate to cap-1 while keeping the extension
+//
+// Clarification: a local CF_HDROP path like C:\dir\f.txt is LEGAL input;
+// rule 2 reduces it to "f.txt" first. The rejection below applies only to
+// a name that is STILL a bare drive root or a UNC root after that step,
+// i.e. a cross-wire name that was never sanitized by the peer.
+// ============================================================
+static BOOL ClipIsReservedStem(const WCHAR* s, ULONG n)
+{
+    static const char* dev[] = {
+        "CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5",
+        "COM6","COM7","COM8","COM9","LPT1","LPT2","LPT3","LPT4",
+        "LPT5","LPT6","LPT7","LPT8","LPT9", NULL
+    };
+    char a[16];
+    ULONG i, k;
+    if (!n || n >= 16) return FALSE;
+    for (i = 0; i < n; i++) {
+        WCHAR c = s[i];
+        if (c >= L'a' && c <= L'z') c = (WCHAR)(c - L'a' + L'A');
+        a[i] = (c < 128) ? (char)c : '?';
+    }
+    a[n] = '\0';
+    for (k = 0; dev[k]; k++)
+        if (lstrcmpA(a, dev[k]) == 0) return TRUE;
+    return FALSE;
+}
+
+static BOOL ClipIsIllegal(WCHAR c)
+{
+    if (c < 0x20) return TRUE;
+    switch (c) {
+    case L'\\': case L'/': case L':': case L'*': case L'?':
+    case L'"':  case L'<': case L'>': case L'|':
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+BOOL ClipSanitizeName(const WCHAR* raw, WCHAR* out, ULONG cap,
+                      ULONGLONG seq)
+{
+    const WCHAR* p;
+    const WCHAR* start;
+    const WCHAR* dot = NULL;
+    WCHAR   tmp[CLIP_NAME_W * 2];
+    ULONG   n = 0, i, extLen = 0, stemLen;
+    BOOL    reserved;
+
+    if (!raw || !out || cap < 8) return FALSE;
+    out[0] = L'\0';
+
+    p = raw;
+    if (p[0] == L'\\' && p[1] == L'\\') {
+        // UNC with no file component: refuse to land anything.
+        if (!p[2]) return FALSE;
+    }
+    if (p[0] && p[1] == L':' && !p[2]) return FALSE;   // bare "X:"
+
+    // rule 2: basename over BOTH separators
+    start = p;
+    for (; *p; p++)
+        if (*p == L'\\' || *p == L'/') start = p + 1;
+    if (!*start) return FALSE;
+
+    // rules 1 and 3
+    for (p = start; *p; p++) {
+        if (ClipIsIllegal(*p)) continue;
+        if (n >= CLIP_NAME_W * 2 - 1) break;
+        tmp[n++] = *p;
+    }
+    tmp[n] = L'\0';
+    if (!n) {
+        StringCchPrintfW(out, cap, L"clip_%I64u", seq);
+        return TRUE;
+    }
+
+    // rule 4: trim
+    while (n && (tmp[n-1] == L' ' || tmp[n-1] == L'.')) tmp[--n] = L'\0';
+    i = 0;
+    while (i < n && tmp[i] == L' ') i++;
+    if (i) {
+        MoveMemory(tmp, tmp + i, (n - i + 1) * sizeof(WCHAR));
+        n -= i;
+    }
+    if (!n || (n == 1 && tmp[0] == L'.') ||
+        (n == 2 && tmp[0] == L'.' && tmp[1] == L'.')) {
+        StringCchPrintfW(out, cap, L"clip_%I64u", seq);
+        return TRUE;
+    }
+
+    // reserved device check on the stem (CON.txt also matches)
+    for (i = 0; i < n; i++)
+        if (tmp[i] == L'.') { dot = tmp + i; break; }
+    stemLen = dot ? (ULONG)(dot - tmp) : n;
+    reserved = ClipIsReservedStem(tmp, stemLen);
+    if (dot) extLen = n - stemLen;
+
+    // rule 6: truncate but keep the extension
+    if (n > cap - 1) {
+        ULONG keepStem;
+        if (extLen && extLen < cap - 2) keepStem = cap - 1 - extLen - 1;
+        else                           keepStem = cap - 1;
+        if (keepStem > n) keepStem = n;
+        if (reserved) {
+            out[0] = L'_';
+            CopyMemory(out + 1, tmp, keepStem * sizeof(WCHAR));
+            out[keepStem + 1] = L'\0';
+        } else {
+            CopyMemory(out, tmp, keepStem * sizeof(WCHAR));
+            out[keepStem] = L'\0';
+        }
+        if (extLen && keepStem + extLen + 1 < cap) {
+            CopyMemory(out + (reserved ? keepStem + 1 : keepStem),
+                       dot, extLen * sizeof(WCHAR));
+            out[(reserved ? keepStem + 1 : keepStem) + extLen] = L'\0';
+        }
+        return TRUE;
+    }
+
+    if (reserved) {
+        out[0] = L'_';
+        CopyMemory(out + 1, tmp, (n + 1) * sizeof(WCHAR));
+    } else {
+        CopyMemory(out, tmp, (n + 1) * sizeof(WCHAR));
+    }
+    return TRUE;
+}
+
+BOOL ClipMakeTempName(WCHAR* out, ULONG cap, const WCHAR* suffix,
+                      ULONGLONG seq)
+{
+    WCHAR dir[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, dir)) return FALSE;
+    return SUCCEEDED(StringCchPrintfW(out, cap,
+        L"%s%s%lu_%I64u%s", dir, L"ClipAgent_",
+        (ULONG)GetCurrentProcessId(), seq, suffix ? suffix : L""));
+}
+
+BOOL ClipMakePartName(const WCHAR* finalName, WCHAR* out, ULONG cap)
+{
+    return SUCCEEDED(StringCchPrintfW(out, cap, L"%s%s",
+                                      finalName, L".part"));
+}
+
+BOOL ClipEnsureDir(const WCHAR* dir)
+{
+    DWORD a;
+    if (!dir || !dir[0]) return FALSE;
+    a = GetFileAttributesW(dir);
+    if (a != INVALID_FILE_ATTRIBUTES)
+        return (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (!CreateDirectoryW(dir, NULL)) {
+        if (GetLastError() == ERROR_ALREADY_EXISTS) return TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+VOID ClipDeleteIfExists(const WCHAR* path)
+{
+    if (!path || !path[0]) return;
+    DeleteFileW(path);
+}
+
+// ============================================================
+// Clipboard read. CF_HDROP carries paths only; never file bytes.
+// ============================================================
+BOOL ClipGetDropPaths(WCHAR*** pPaths, PULONG pCount)
+{
+    HDROP  hDrop;
+    UINT   n, i;
+    WCHAR** arr;
+
+    if (pPaths) *pPaths = NULL;
+    if (pCount) *pCount = 0;
+    if (!OpenClipboard(NULL)) return FALSE;
+    hDrop = (HDROP)GetClipboardData(CF_HDROP);
+    if (!hDrop) { CloseClipboard(); return FALSE; }
+    n = DragQueryFileW(hDrop, 0xFFFFFFFFu, NULL, 0);
+    if (!n || n > CLIP_MAX_PATHS) { CloseClipboard(); return FALSE; }
+
+    arr = (WCHAR**)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                             (SIZE_T)n * sizeof(WCHAR*));
+    if (!arr) { CloseClipboard(); return FALSE; }
+    for (i = 0; i < n; i++) {
+        UINT len = DragQueryFileW(hDrop, i, NULL, 0);
+        WCHAR* s = (WCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                     ((SIZE_T)len + 2) * sizeof(WCHAR));
+        if (!s) break;
+        DragQueryFileW(hDrop, i, s, len + 1);
+        arr[i] = s;
+    }
+    CloseClipboard();
+    if (i != n) {
+        for (UINT k = 0; k < i; k++) FreeBuf(arr[k], 0);
+        FreeBuf(arr, (ULONG)(n * sizeof(WCHAR*)));
+        return FALSE;
+    }
+    if (pPaths) *pPaths = arr;
+    if (pCount) *pCount = n;
+    return TRUE;
+}
+
+BOOL ClipGetUnicodeText(WCHAR** pText, PULONGLONG pBytes)
+{
+    HGLOBAL  h;
+    LPCWSTR  src;
+    SIZE_T   cch;
+    WCHAR*   dst;
+
+    if (pText)  *pText  = NULL;
+    if (pBytes) *pBytes = 0;
+    if (!OpenClipboard(NULL)) return FALSE;
+    h = GetClipboardData(CF_UNICODETEXT);
+    if (!h) { CloseClipboard(); return FALSE; }
+    src = (LPCWSTR)GlobalLock(h);
+    if (!src) { CloseClipboard(); return FALSE; }
+    cch = 0;
+    while (cch < CLIP_MAX_TEXT_WCH && src[cch]) cch++;
+    dst = (WCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                            (cch + 1) * sizeof(WCHAR));
+    if (dst) {
+        CopyMemory(dst, src, cch * sizeof(WCHAR));
+        dst[cch] = L'\0';
+        if (pText)  *pText  = dst;
+        if (pBytes) *pBytes = (ULONGLONG)cch * sizeof(WCHAR);
+    }
+    GlobalUnlock(h);
+    CloseClipboard();
+    return dst != NULL;
+}
+
+BOOL ClipSetUnicodeText(const WCHAR* text)
+{
+    SIZE_T   cch, bytes;
+    HGLOBAL  h;
+    LPWSTR   p;
+    BOOL     ok = FALSE;
+    if (!text) return FALSE;
+    cch = (SIZE_T)lstrlenW(text);
+    if (cch > CLIP_MAX_TEXT_WCH) return FALSE;
+    bytes = (cch + 1) * sizeof(WCHAR);
+    if (!OpenClipboard(NULL)) return FALSE;
+    EmptyClipboard();
+    h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (h) {
+        p = (LPWSTR)GlobalLock(h);
+        if (p) {
+            CopyMemory(p, text, bytes);
+            GlobalUnlock(h);
+            ok = SetClipboardData(CF_UNICODETEXT, h) != NULL;
+        }
+        if (!ok) GlobalFree(h);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+// ============================================================
+// Advert total. Recursion is depth-capped and never reads file data.
+// ============================================================
+static void CalcOne(const WCHAR* path, ULONG depth, PULONGLONG pTotal,
+                    PULONGLONG pLargest, PULONG pFiles, PULONG pDirs)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    WCHAR  spec[MAX_PATH];
+    WCHAR  child[MAX_PATH];
+    HANDLE h;
+    WIN32_FIND_DATAW fd;
+
+    if (depth > CLIP_MAX_DEPTH) return;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return;
+
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        (*pDirs)++;
+        StringCchPrintfW(spec, MAX_PATH, L"%s\\*", path);
+        h = FindFirstFileW(spec, &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!lstrcmpW(fd.cFileName, L".") ||
+                !lstrcmpW(fd.cFileName, L"..")) continue;
+            StringCchPrintfW(child, MAX_PATH, L"%s\\%s", path, fd.cFileName);
+            CalcOne(child, depth + 1, pTotal, pLargest, pFiles, pDirs);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        return;
+    }
+
+    ULONGLONG sz = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    (*pFiles)++;
+    *pTotal += sz;
+    if (sz > *pLargest) *pLargest = sz;
+}
+
+BOOL ClipCalcTotal(WCHAR** paths, ULONG count, PULONGLONG pTotal,
+                   PULONGLONG pLargest, PULONG pFiles, PULONG pDirs)
+{
+    ULONG i;
+    if (pTotal)   *pTotal   = 0;
+    if (pLargest) *pLargest = 0;
+    if (pFiles)   *pFiles   = 0;
+    if (pDirs)    *pDirs    = 0;
+    if (!paths || !count) return FALSE;
+    for (i = 0; i < count; i++)
+        CalcOne(paths[i], 0, pTotal, pLargest, pFiles, pDirs);
+    return TRUE;
+}
+
+VOID PendingClear(VOID)
+{
+    ULONG i;
+    for (i = 0; i < g.pendingCount; i++) {
+        if (g.pendingPaths[i]) {
+            ULONG n = (ULONG)(lstrlenW(g.pendingPaths[i]) + 1) * sizeof(WCHAR);
+            ClipZeroAndFree(g.pendingPaths[i], n);
+        }
+    }
+    if (g.pendingPaths) {
+        ClipZeroAndFree(g.pendingPaths,
+                        g.pendingCap * (ULONG)sizeof(WCHAR*));
+        g.pendingPaths = NULL;
+    }
+    g.pendingCount = 0;
+    g.pendingCap   = 0;
+    if (g.pendingText) {
+        ClipZeroAndFree(g.pendingText, (ULONG)g.pendingTextBytes + sizeof(WCHAR));
+        g.pendingText       = NULL;
+        g.pendingTextBytes  = 0;
+    }
+    ZeroMemory(&g.pendingList, sizeof(g.pendingList));
+}
+
+BOOL PendingEnsure(ULONG need)
+{
+    WCHAR** np;
+    ULONG   cap, i;
+    if (need <= g.pendingCap) return TRUE;
+    cap = g.pendingCap ? g.pendingCap : 16;
+    while (cap < need) {
+        if (cap > CLIP_MAX_PATHS / 2) { cap = CLIP_MAX_PATHS; break; }
+        cap *= 2;
+    }
+    if (cap > CLIP_MAX_PATHS) cap = CLIP_MAX_PATHS;
+    if (need > cap) return FALSE;
+    np = (WCHAR**)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                            (SIZE_T)cap * sizeof(WCHAR*));
+    if (!np) return FALSE;
+    for (i = 0; i < g.pendingCount; i++) np[i] = g.pendingPaths[i];
+    if (g.pendingPaths)
+        ClipZeroAndFree(g.pendingPaths, g.pendingCap * (ULONG)sizeof(WCHAR*));
+    g.pendingPaths = np;
+    g.pendingCap   = cap;
+    return TRUE;
+}

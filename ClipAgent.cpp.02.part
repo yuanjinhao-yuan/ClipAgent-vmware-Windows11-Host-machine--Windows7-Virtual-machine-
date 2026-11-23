@@ -1,0 +1,349 @@
+// ClipAgent.cpp part 02 -- state machine, cleanup, interruption, sweep.
+// ASCII only. // comments only. No non-ASCII bytes in this source.
+// Chinese UI strings are defined in part 03 as L"\uXXXX" wide literals.
+
+// ============================================================
+// Contracts for part 04. Written here so the merge stays consistent.
+//  1) g.sock is set to INVALID_SOCKET explicitly by main() before any
+//     socket call. Global zero-init leaves it 0, which is NOT valid here.
+//  2) ReceiverBegin() must name the .part file with the SAME
+//     ClipAgent_<pid>_<seq> prefix used by ClipMakeTempName(), e.g.
+//     "<outdir>\\ClipAgent_1234_7.part". The FINAL name (sanitized
+//     basename) is applied only by MoveFileEx after CRC success.
+//     This lets SweepStaleFiles() use one pattern "ClipAgent_*" for
+//     both %TEMP% and --outdir without ever touching user .part files.
+//  3) Passive pause: HandleFrame(FRAME_PAUSE) calls
+//       CleanupTransfer(CLIP_R_PAUSE_KEEP, TRUE)
+//       TransferSetState(CLIP_PAUSED)
+//     directly. It must NOT call PauseTransfer(), or the frame echoes.
+//  4) NetThread's main loop uses select() with a 200 ms timeout. Each
+//     tick it polls g_clipResumeKick. If set AND g.zipTemp[0] != 0
+//     (this end is the sender), it calls
+//       BuildAndSendPayload(g.requestId, TRUE)
+//     to continue from g.bytesDone. If this end is the receiver it just
+//     ignores the kick and waits for the peer's FRAME_DATA.
+//  5) HandleFrame(FRAME_RESUME) on the sender calls
+//       BuildAndSendPayload(requestId, TRUE)
+//     on the receiver reopens g.partPath with FILE_APPEND_DATA.
+//     HandleFrame(FRAME_DATA) must reopen g.hPart if it is NULL while
+//     state == CLIP_TRANSFER and g.partPath[0] != 0.
+// ============================================================
+
+// part02 -> part04 internal kick. Polled by NetThread's select loop.
+volatile LONG g_clipResumeKick   = 0;
+ULONG         g_clipResumeAction = 0;
+
+// ---- helpers, file scope ----
+static ULONG ClipParsePidFromName(const WCHAR* name)
+{
+    const WCHAR* p = name;
+    ULONG pid = 0;
+    if (!name) return 0;
+    while (*p && *p != L'_') p++;          // skip "ClipAgent"
+    if (!*p) return 0;
+    p++;
+    if (*p < L'0' || *p > L'9') return 0;  // not our naming scheme
+    while (*p >= L'0' && *p <= L'9') {
+        pid = pid * 10u + (ULONG)(*p - L'0');
+        p++;
+    }
+    return pid;
+}
+
+static BOOL ClipAgeMinutes(const WCHAR* full, PULONG pMin)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    ULARGE_INTEGER ft, now;
+    FILETIME fnow;
+    ULONGLONG d;
+    if (pMin) *pMin = 0;
+    if (!full || !GetFileAttributesExW(full, GetFileExInfoStandard, &fad))
+        return FALSE;
+    ft.LowPart  = fad.ftLastWriteTime.dwLowDateTime;
+    ft.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    GetSystemTimeAsFileTime(&fnow);
+    now.LowPart  = fnow.dwLowDateTime;
+    now.HighPart = fnow.dwHighDateTime;
+    if (now.QuadPart <= ft.QuadPart) return TRUE;
+    d = (ULONGLONG)(now.QuadPart - ft.QuadPart);
+    if (pMin) *pMin = (ULONG)(d / (10000000ull * 60ull));
+    return TRUE;
+}
+
+static BOOL ClipIsActivePath(const WCHAR* full)
+{
+    if (!full || !full[0]) return FALSE;
+    if (g.zipTemp[0]  && !lstrcmpiW(full, g.zipTemp))  return TRUE;
+    if (g.cdTemp[0]   && !lstrcmpiW(full, g.cdTemp))   return TRUE;
+    if (g.partPath[0] && !lstrcmpiW(full, g.partPath)) return TRUE;
+    return FALSE;
+}
+
+static void SweepJoin(WCHAR* out, ULONG cap,
+                      const WCHAR* dir, const WCHAR* name)
+{
+    size_t n;
+    if (!dir || !name) { if (out && cap) out[0] = L'\0'; return; }
+    n = (size_t)lstrlenW(dir);
+    if (n && dir[n - 1] == L'\\')
+        StringCchPrintfW(out, cap, L"%s%s", dir, name);
+    else
+        StringCchPrintfW(out, cap, L"%s\\%s", dir, name);
+}
+
+static void SweepOneDir(const WCHAR* dir, BOOL atStartup)
+{
+    WCHAR spec[MAX_PATH];
+    WCHAR full[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    ULONG  myPid = GetCurrentProcessId();
+
+    if (!dir || !dir[0]) return;
+    SweepJoin(spec, MAX_PATH, dir, L"ClipAgent_*");
+    h = FindFirstFileW(spec, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        ULONG pid, age = 0;
+        BOOL  active, keep = FALSE;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        pid = ClipParsePidFromName(fd.cFileName);
+        if (pid == 0) continue;            // not ours, never delete
+
+        SweepJoin(full, MAX_PATH, dir, fd.cFileName);
+        active = ClipIsActivePath(full);
+
+        if (active && !atStartup) {
+            if (g.state == CLIP_TRANSFER) {
+                keep = TRUE;
+            } else if (g.state == CLIP_PAUSED) {
+                ClipAgeMinutes(full, &age);
+                if (age < CLIP_PAUSE_TTL_MIN) {
+                    keep = TRUE;
+                } else {
+                    Log(LOG_WARN,
+                        "paused transfer expired (%u min), temp files removed",
+                        age);
+                    TrayBalloon("ClipAgent",
+                                "paused transfer expired, temp files removed",
+                                0x00000001);
+                }
+            }
+        }
+
+        if (!keep) {
+            DeleteFileW(full);
+            Log(LOG_INFO,
+                "swept stale: pid=%u mine=%u age=%umin active=%d startup=%d",
+                pid, myPid, age, (int)active, (int)atStartup);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// ============================================================
+// State
+// ============================================================
+VOID TransferSetState(CLIP_STATE st)
+{
+    g.state = st;
+    switch (st) {
+    case CLIP_IDLE:
+        TraySetTip("ClipAgent: idle"); break;
+    case CLIP_HAVE_LIST:
+        TraySetTip("ClipAgent: remote content ready"); break;
+    case CLIP_TRANSFER:
+        TraySetTip("ClipAgent: transferring"); break;
+    case CLIP_PAUSED:
+        TraySetTip("ClipAgent: paused"); break;
+    default:
+        TraySetTip("ClipAgent"); break;
+    }
+}
+
+BOOL TransferIsAborted(VOID)
+{
+    return InterlockedCompareExchange(&g.abort, 0, 0) != 0;
+}
+
+VOID TransferRequestAbort(VOID)
+{
+    // Both flags: g.abort stops the 64 KiB stream loops in part 04,
+    // g.zip.Abort stops any in-flight compression callback in miniz.c.
+    InterlockedExchange(&g.abort, 1);
+    InterlockedExchange(&g.zip.Abort, 1);
+}
+
+// ============================================================
+// Single idempotent teardown. Every exit routes through here.
+//   keepPartial == TRUE  -> PAUSE: zip + .part stay on disk, counters stay
+//   keepPartial == FALSE -> OK / cancel / peer cancel / disconnect / fail:
+//                           every temp artifact is removed, buffers zeroed
+// ============================================================
+VOID CleanupTransfer(CLIP_REASON reason, BOOL keepPartial)
+{
+    const char* r = "unknown";
+    ULONG level = LOG_INFO;
+
+    // 1) stop compression callbacks first
+    InterlockedExchange(&g.zip.Abort, 1);
+
+    // 2) close receiver .part handle (repeat-safe)
+    if (g.hPart && g.hPart != INVALID_HANDLE_VALUE) {
+        CloseHandle(g.hPart);
+    }
+    g.hPart = NULL;
+
+    // 3) close any zip-side handles left open by a mid-compression abort
+    if (g.zip.hZip && g.zip.hZip != INVALID_HANDLE_VALUE) {
+        CloseHandle(g.zip.hZip);
+        g.zip.hZip = INVALID_HANDLE_VALUE;
+    }
+    if (g.zip.hCd && g.zip.hCd != INVALID_HANDLE_VALUE) {
+        CloseHandle(g.zip.hCd);
+        g.zip.hCd = INVALID_HANDLE_VALUE;
+    }
+
+    // 4) temp artifacts
+    if (!keepPartial) {
+        ClipDeleteIfExists(g.zipTemp);
+        ClipDeleteIfExists(g.cdTemp);
+        ClipDeleteIfExists(g.partPath);
+        ClipDeleteIfExists(g.zip.ZipPath);
+        ClipDeleteIfExists(g.zip.CdPath);
+        g.zipTemp[0]   = L'\0';
+        g.cdTemp[0]    = L'\0';
+        g.partPath[0]  = L'\0';
+        g.finalPath[0] = L'\0';   // string only; the delivered file stays
+    }
+    // keepPartial keeps g.zipTemp / g.partPath for resume.
+    ZeroMemory(&g.zip, sizeof(g.zip));
+    InterlockedExchange(&g.zip.Abort, 1);  // stay aborted until Create resets
+
+    // 5) counters and run-time buffers. NEVER clear on a pause.
+    if (!keepPartial) {
+        g.bytesDone   = 0;
+        g.bytesTotal  = 0;
+        g.blockSeq    = 0;
+        g.wholeCrc    = 0;
+        g.requestId   = 0;
+        g.textMode    = FALSE;
+        g.lastErr     = ERROR_SUCCESS;
+        g.pauseTick   = 0;
+        g.skipCount   = 0;
+        g.skipComment[0] = '\0';
+        ZeroMemory(&g.pauseInfo, sizeof(g.pauseInfo));
+        InterlockedExchange(&g.abort, 0);
+    }
+    // pendingPaths / pendingText / pendingList are the ADVERT, not the
+    // transfer: deliberately untouched. IDLE still has content to paste.
+
+    // 6) state
+    g.state = keepPartial ? CLIP_PAUSED : CLIP_IDLE;
+    TransferSetState(g.state);
+
+    // 7) log
+    switch (reason) {
+    case CLIP_R_OK:           r = "ok";           level = LOG_OK;   break;
+    case CLIP_R_USER_CANCEL:  r = "user-cancel";  level = LOG_WARN; break;
+    case CLIP_R_PEER_CANCEL:  r = "peer-cancel";  level = LOG_WARN; break;
+    case CLIP_R_DISCONNECT:   r = "disconnect";   level = LOG_ERR;  break;
+    case CLIP_R_TIMEOUT:      r = "timeout";      level = LOG_WARN; break;
+    case CLIP_R_SHARING:      r = "sharing";      level = LOG_WARN; break;
+    case CLIP_R_ACCESS:       r = "access";       level = LOG_WARN; break;
+    case CLIP_R_DISK_FULL:    r = "disk-full";    level = LOG_ERR;  break;
+    case CLIP_R_PATH:         r = "path";         level = LOG_WARN; break;
+    case CLIP_R_PAUSE_KEEP:   r = "pause-keep";   level = LOG_WARN; break;
+    default:                  r = "unknown";     level = LOG_INFO; break;
+    }
+    Log(level, "cleanup: reason=%s keep=%d state=%u",
+        r, (int)keepPartial, (ULONG)g.state);
+}
+
+// ============================================================
+// Startup / periodic sweep. Called at process start, on IDT_SWEEP,
+// and once again at process exit.
+// ============================================================
+VOID SweepStaleFiles(BOOL atStartup)
+{
+    WCHAR tmp[MAX_PATH];
+    if (g.tempDir[0]) {
+        SweepOneDir(g.tempDir, atStartup);
+    } else if (GetTempPathW(MAX_PATH, tmp)) {
+        SweepOneDir(tmp, atStartup);
+    }
+    if (g.outDir[0]) SweepOneDir(g.outDir, atStartup);
+}
+
+// ============================================================
+// T1/T2 local pause. Emits FRAME_PAUSE; the peer goes passive.
+// ============================================================
+VOID PauseTransfer(const CLIP_PAUSE* p)
+{
+    if (!p) return;
+    CopyMemory(&g.pauseInfo, p, sizeof(CLIP_PAUSE));
+    g.pauseTick = GetTickCount();
+
+    CleanupTransfer(CLIP_R_PAUSE_KEEP, TRUE);   // sets PAUSED + tip
+
+    if (g.sock != INVALID_SOCKET && g.sock != 0) {
+        NetSendFrame(FRAME_PAUSE, g.requestId,
+                     p, (ULONG)sizeof(CLIP_PAUSE), &g.lastErr);
+    }
+    Log(LOG_WARN, "paused: class=%u win32=%u req=%I64u",
+        p->ErrClass, p->Win32Error, g.requestId);
+    TrayBalloon("ClipAgent",
+                "transfer paused - resolve then press Ctrl+Alt+V",
+                0x00000001);
+}
+
+// ============================================================
+// Resume after a pause. Only flips state, clears abort, emits the
+// frame, and kicks the local NetThread. Chunk continuation lives in
+// part 04 (BuildAndSendPayload / ReceiverWriteChunk).
+//   action: 0=resume, 1=skip-subject, 2=terminate-owner
+// ============================================================
+BOOL ResumeTransfer(ULONG action)
+{
+    CLIP_RESUME r;
+    if (g.state != CLIP_PAUSED) return FALSE;
+
+    ZeroMemory(&r, sizeof(r));
+    r.RequestId = g.requestId;
+    r.Action    = action;
+    r.Reserved  = 0;
+
+    InterlockedExchange(&g.abort, 0);
+    g.state = CLIP_TRANSFER;
+    TransferSetState(CLIP_TRANSFER);
+
+    g_clipResumeAction = action;
+    InterlockedExchange(&g_clipResumeKick, 1);
+
+    if (g.sock != INVALID_SOCKET && g.sock != 0) {
+        NetSendFrame(FRAME_RESUME, g.requestId,
+                     &r, (ULONG)sizeof(CLIP_RESUME), &g.lastErr);
+    }
+    Log(LOG_OK, "resume: action=%u req=%I64u", action, g.requestId);
+    return TRUE;
+}
+
+// ============================================================
+// T3: peer closed or WSA error. No retry, no resume, clean and idle.
+// ============================================================
+VOID HandleDisconnect(DWORD err)
+{
+    if (g.sock != INVALID_SOCKET && g.sock != 0) {
+        shutdown(g.sock, SD_BOTH);
+        closesocket(g.sock);
+        g.sock = INVALID_SOCKET;
+    }
+    if (err == CLIP_NET_CLOSED)
+        Log(LOG_WARN, "peer closed connection, transfer cleaned");
+    else
+        Log(LOG_ERR, "socket error %u, transfer cleaned", err);
+
+    CleanupTransfer(CLIP_R_DISCONNECT, FALSE);
+    TraySetTip("ClipAgent: disconnected");
+}

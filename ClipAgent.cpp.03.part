@@ -1,0 +1,309 @@
+// ClipAgent.cpp part 03 -- UI, process query, error classification.
+// ASCII only. // comments only. Chinese strings as L"\uXXXX" from part 02.
+
+// ---- non-modal choice window (60s timeout, no blocking) ----
+static HWND    g_hwndChoice = NULL;
+static UINT_PTR g_choiceTimer = 0;
+static DWORD    g_choiceStart = 0;
+static UINT_PTR g_choiceCountdown = 0;
+
+#define IDM_EXIT     1001
+#define IDM_PAUSE    1002
+#define IDM_RESUME   1003
+#define IDM_CANCEL   1004
+#define IDM_SHOWLOG  1005
+
+// forward declaration so part 04 can call it
+static BOOL ClipIsCriticalProcessA(const char* n);
+
+static LRESULT CALLBACK ChoiceWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_CREATE:
+        g_choiceStart = GetTickCount();
+        g_choiceCountdown = SetTimer(h, 1, 1000, NULL);
+        return 0;
+    case WM_TIMER:
+        if (w == 1) {
+            DWORD elapsed = GetTickCount() - g_choiceStart;
+            if (elapsed >= 60000u) {
+                KillTimer(h, 1);
+                g_choiceCountdown = 0;
+                // CH_TIMEOUT semantic: treat as skip
+                g_choiceResult = CH_TIMEOUT;
+                PostMessageW(h, WM_CLOSE, 0, 0);
+            } else {
+                WCHAR title[128];
+                DWORD remain = 60 - (elapsed / 1000);
+                StringCchPrintfW(title, 128,
+                    L"\u8BF7\u9009\u62E9\u5904\u7406\u65B9\u5F0F (%lu)",
+                    remain);
+                SetWindowTextW(h, title);
+            }
+        }
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDCANCEL:
+            g_choiceResult = CH_CANCEL;
+            PostMessageW(h, WM_CLOSE, 0, 0);
+            break;
+        case IDOK:
+            g_choiceResult = CH_RESUME;
+            PostMessageW(h, WM_CLOSE, 0, 0);
+            break;
+        case IDM_TERM:
+            g_choiceResult = CH_TERM;
+            PostMessageW(h, WM_CLOSE, 0, 0);
+            break;
+        case IDM_SKIP:
+            g_choiceResult = CH_SKIP;
+            PostMessageW(h, WM_CLOSE, 0, 0);
+            break;
+        }
+        return 0;
+    case WM_CLOSE:
+        return 0;   // ignore: only the four buttons or the timeout decide
+    case WM_DESTROY:
+        if (g_choiceCountdown) {
+            KillTimer(h, g_choiceCountdown);
+            g_choiceCountdown = 0;
+        }
+        g_hwndChoice = NULL;
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static BOOL UiCreateChoiceWindow(VOID)
+{
+    WNDCLASSEXW wc;
+    WCHAR promptW[1024];
+    const WCHAR* hint;
+
+    if (g_hwndChoice && IsWindow(g_hwndChoice)) {
+        SetForegroundWindow(g_hwndChoice);
+        return TRUE;
+    }
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = ChoiceWndProc;
+    wc.hInstance     = GetModuleHandleW(NULL);
+    wc.hIcon         = LoadIconW(NULL, IDI_WARNING);
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"ClipAgentChoice";
+    if (!RegisterClassExW(&wc)) return FALSE;
+
+    hint = S_CHOICE_HINT;
+    StringCchCopyW(promptW, 1024, g_choicePrompt);
+    StringCchCatW(promptW, 1024, L"\r\n\r\n");
+    StringCchCatW(promptW, 1024, hint);
+
+    g_hwndChoice = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
+        L"ClipAgentChoice",
+        L"\u8BF7\u9009\u62E9\u5904\u7406\u65B9\u5F0F (60)",
+        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, 520, 360,
+        NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (!g_hwndChoice) return FALSE;
+
+    CreateWindowW(L"STATIC", promptW,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        10, 10, 490, 180,
+        g_hwndChoice, NULL, GetModuleHandleW(NULL), NULL);
+
+    CreateWindowW(L"BUTTON", L"\u7EE7\u7EED/\u91CD\u8BD5",
+        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        10, 200, 120, 30,
+        g_hwndChoice, (HMENU)IDOK, GetModuleHandleW(NULL), NULL);
+
+    CreateWindowW(L"BUTTON", L"\u7EC8\u6B62\u5360\u7528\u8FDB\u7A0B",
+        WS_CHILD | WS_VISIBLE,
+        140, 200, 140, 30,
+        g_hwndChoice, (HMENU)IDM_TERM, GetModuleHandleW(NULL), NULL);
+
+    CreateWindowW(L"BUTTON", L"\u8DF3\u8FC7\u6B64\u6587\u4EF6",
+        WS_CHILD | WS_VISIBLE,
+        290, 200, 120, 30,
+        g_hwndChoice, (HMENU)IDM_SKIP, GetModuleHandleW(NULL), NULL);
+
+    CreateWindowW(L"BUTTON", L"\u53D6\u6D88",
+        WS_CHILD | WS_VISIBLE,
+        10, 240, 120, 30,
+        g_hwndChoice, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+
+    ShowWindow(g_hwndChoice, SW_SHOW);
+    SetForegroundWindow(g_hwndChoice);
+    return TRUE;
+}
+
+// ---- process occupancy query (Restart Manager) ----
+static BOOL ClipQueryOwnerProcesses(const WCHAR* path, WCHAR* out, DWORD outChars)
+{
+    DWORD   sess = 0;
+    UINT    infoCount = 0;
+    RM_PROCESS_INFO* info = NULL;
+    WCHAR   key[CCH_RM_SESSION_KEY + 1];
+    DWORD   dw = 0;
+    UINT    i;
+    BOOL    found = FALSE;
+
+    if (!path || !out || outChars < 256) return FALSE;
+    out[0] = L'\0';
+
+    if (RmStartSession(&sess, 0, key) != ERROR_SUCCESS) return FALSE;
+    if (RmRegisterResources(sess, 1, &path, 0, NULL, 0, NULL)
+        != ERROR_SUCCESS) {
+        RmEndSession(sess);
+        return FALSE;
+    }
+    if (RmGetList(sess, &infoCount, &dw, NULL) != ERROR_MORE_DATA &&
+        RmGetList(sess, &infoCount, &dw, NULL) != ERROR_SUCCESS) {
+        RmEndSession(sess);
+        return FALSE;
+    }
+    if (infoCount == 0) {
+        RmEndSession(sess);
+        return FALSE;
+    }
+    info = (RM_PROCESS_INFO*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+        (SIZE_T)infoCount * sizeof(RM_PROCESS_INFO));
+    if (!info) {
+        RmEndSession(sess);
+        return FALSE;
+    }
+    if (RmGetList(sess, &infoCount, &dw, info) != ERROR_SUCCESS) {
+        HeapFree(GetProcessHeap(), 0, info);
+        RmEndSession(sess);
+        return FALSE;
+    }
+
+    for (i = 0; i < infoCount && !found; i++) {
+        WCHAR exe[MAX_PATH];
+        DWORD exeLen = MAX_PATH;
+        HANDLE hProc;
+
+        exe[0] = L'\0';
+        hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+            info[i].Process.dwProcessId);
+        if (hProc) {
+            if (QueryFullProcessImageNameW(hProc, 0, exe, &exeLen))
+                found = TRUE;
+            CloseHandle(hProc);
+        }
+    }
+
+    if (found) {
+        StringCchPrintfW(out, outChars,
+            L"\u8FDB\u7A0B\u5360\u7528: %s (PID %lu)",
+            exe, (ULONG)info[i-1].Process.dwProcessId);
+    }
+
+    HeapFree(GetProcessHeap(), 0, info);
+    RmEndSession(sess);
+    return found;
+}
+
+// ---- error classification (four classes) ----
+ULONG ClipClassifyError(DWORD e)
+{
+    if (e == ERROR_DISK_FULL) return CLIPERR_DISK_FULL;
+    if (e == ERROR_ACCESS_DENIED) return CLIPERR_ACCESS;
+    if (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION)
+        return CLIPERR_SHARING;
+    if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
+        return CLIPERR_NOT_FOUND;
+    if (e == ERROR_INVALID_NAME || e == ERROR_BAD_PATHNAME)
+        return CLIPERR_NAME;
+    return CLIPERR_UNKNOWN;
+}
+
+ULONG ClipClassifyAndReport(const WCHAR* path, DWORD e,
+    char* report, ULONG reportChars)
+{
+    ULONG cls = ClipClassifyError(e);
+    char   pathA[512];
+    char*  reason;
+
+    if (!path || !report || reportChars < 256) return cls;
+    WideCharToMultiByte(CP_ACP, 0, path, -1, pathA, 512, NULL, NULL);
+
+    switch (cls) {
+    case CLIPERR_DISK_FULL:
+        reason = "disk full"; break;
+    case CLIPERR_ACCESS:
+        reason = "access denied"; break;
+    case CLIPERR_SHARING:
+        reason = "file locked by another process"; break;
+    case CLIPERR_NOT_FOUND:
+        reason = "file or path not found"; break;
+    case CLIPERR_NAME:
+        reason = "invalid filename"; break;
+    default:
+        reason = "unknown error"; break;
+    }
+
+    if (cls == CLIPERR_ACCESS || cls == CLIPERR_SHARING) {
+        WCHAR occupant[512];
+        if (ClipQueryOwnerProcesses(path, occupant, 512)) {
+            char occupantA[512];
+            WideCharToMultiByte(CP_ACP, 0, occupant, -1,
+                occupantA, 512, NULL, NULL);
+            StringCchPrintfA(report, reportChars,
+                "%s\r\n%s\r\n\r\n"
+                "choose:\r\n"
+                "  CONTINUE  - retry\r\n"
+                "  TERMINATE- kill %S\r\n"
+                "  SKIP      - skip this file\r\n"
+                "  CANCEL    - abort entire transfer\r\n"
+                "  (60s timeout = skip)",
+                reason, occupantA, occupantA);
+        } else {
+            StringCchPrintfA(report, reportChars,
+                "%s\r\n%s\r\n\r\n"
+                "choose:\r\n"
+                "  CONTINUE  - retry\r\n"
+                "  TERMINATE - kill occupant (none identified)\r\n"
+                "  SKIP      - skip this file\r\n"
+                "  CANCEL    - abort entire transfer\r\n"
+                "  (60s timeout = skip)",
+                reason, pathA);
+        }
+    } else {
+        StringCchPrintfA(report, reportChars,
+            "%s\r\n%s\r\n\r\n"
+            "choose:\r\n"
+            "  CONTINUE  - retry\r\n"
+            "  SKIP      - skip this file\r\n"
+            "  CANCEL    - abort entire transfer\r\n"
+            "  (60s timeout = skip)",
+            reason, pathA);
+    }
+    return cls;
+}
+
+// ---- critical process whitelist (ASCII narrow wrapper) ----
+static BOOL ClipIsCriticalProcessA(const char* n)
+{
+    WCHAR w[MAX_PATH];
+    if (!n) return TRUE;
+    MultiByteToWideChar(CP_ACP, 0, n, -1, w, MAX_PATH);
+    return ClipIsCriticalProcess(w);
+}
+
+// ---- skip list display (zip comment) ----
+static VOID ClipShowSkipList(const char* comment)
+{
+    WCHAR w[1024];
+    if (!comment || !*comment) return;
+    MultiByteToWideChar(CP_ACP, 0, comment, -1, w, 1024);
+    // no extra MultiByteToWideChar call here (was the redundant one)
+    MessageBoxW(g.hwnd, w,
+        L"\u8DF3\u8FC7\u7684\u6587\u4EF6\u5217\u8868",
+        MB_OK | MB_ICONINFORMATION);
+}

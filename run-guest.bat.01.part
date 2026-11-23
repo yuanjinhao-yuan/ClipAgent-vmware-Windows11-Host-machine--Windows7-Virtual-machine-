@@ -1,0 +1,24 @@
+@echo off
+REM ClipAgent guest side (Win7 x64). Auto-reconnect loop.
+REM PURE ASCII, NO BOM.
+setlocal EnableDelayedExpansion
+cd /d "%~dp0"
+
+set "HOST_IP=192.168.1.50"
+set "PORT=8080"
+set "KEY=mon"
+set "OUTDIR=C:\ClipInbox"
+set "EXE=release\ClipAgent.exe"
+
+if not exist "%OUTDIR%" mkdir "%OUTDIR%"
+if not exist "%EXE%" (
+    echo [X] %EXE% not found. Run merge.bat / build.bat first.
+    exit /b 1
+)
+
+:LOOP
+echo [*] %TIME% connecting to %HOST_IP%:%PORT%
+"%EXE%" --connect %HOST_IP%:%PORT% --key %KEY% --outdir "%OUTDIR%" --quiet
+echo [!] %TIME% exited rc=%errorlevel%, restart in 3s
+timeout /t 3 >nul
+goto LOOP

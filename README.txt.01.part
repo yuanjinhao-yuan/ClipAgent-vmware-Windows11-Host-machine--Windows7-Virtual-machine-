@@ -1,0 +1,107 @@
+ClipAgent -- Win7 x64 / Win11 x64 clipboard agent (pull model)
+===============================================================
+
+Layout
+  parts\\*.part        source fragments, one per delivery turn
+  merge.bat           concatenate parts -> real files, then build
+  ClipProtocol.h      wire format, shared by both ends
+  miniz.h / miniz.c   built-in store-only ZIP writer (NOT upstream miniz)
+  ClipAgent.cpp       main program, delivered in 4 segments
+  build.bat           cl /MT /utf-8 /SUBSYSTEM:CONSOLE,6.01
+  run-host.bat        Win11 side, auto reconnect
+  run-guest.bat       Win7 side, auto reconnect
+  install-autorun.bat HKCU Run key, no admin needed
+  release\\ClipAgent.exe
+
+Build
+  1. Open a VS x64 Native Tools Command Prompt.
+  2. merge.bat --no-build     (check every [have])
+  3. merge.bat                (assemble + build -> release\\ClipAgent.exe)
+
+Run
+  Host (Win11):
+    ClipAgent.exe --listen 8080 --key mon --outdir D:\\ClipInbox
+  Guest (Win7):
+    ClipAgent.exe --connect 192.168.1.50:8080 --key mon --outdir C:\\ClipInbox
+  Options:
+    --key <s>           shared LAN label, NOT encryption
+    --outdir <dir>      fallback landing directory
+    --max-file-mb <n>   ask before sending above n MB (default 256)
+    --confirm-mb <n>    warn level (default 50)
+    --quiet             hide console, tray only
+    --help              show usage
+
+Hotkeys (only way to trigger a transfer)
+  Ctrl+Alt+V   paste remote content (PULL). In PAUSED state: resume.
+  Ctrl+Alt+C   cancel current transfer.
+  Ctrl+Alt+S   show / hide the log window.
+
+Model
+  Copying advertises only. FRAME_LIST carries a fixed-size summary and
+  ZERO file bytes. Nothing is transmitted until the far end presses
+  Ctrl+Alt+V, which sends FRAME_PULL. Files and folders are packed into
+  a temp ZIP (store method) and streamed in 64 KiB chunks. Clipboard
+  text is streamed the same way and goes to CF_UNICODETEXT, no file.
+
+Encoding
+  Every delivered source file is pure ASCII (every byte < 0x80).
+  Chinese UI text appears only as L"\\uXXXX" wide literals in
+  ClipAgent.cpp part 03. No BOM is required anywhere. .bat files MUST
+  stay BOM-free or cmd.exe misparses the first line. build.bat passes
+  /utf-8 as a harmless safety net.
+  Check: powershell -NoProfile -Command "$b=[IO.File]::ReadAllBytes('ClipAgent.cpp'); ($b|?{$_ -gt 0x7F}).Count"
+
+Invariants
+  1. Copying never transfers data. Only Ctrl+Alt+V pulls.
+  2. Peak heap stays at one 64 KiB buffer per side, independent of
+     file size. The receiver writes chunks straight to disk.
+  3. The temp zip is deleted on EVERY exit path, success or failure.
+  4. At most one ClipAgent_*.zip in %TEMP% and one *.part in outdir.
+  5. Cleanup is idempotent and every exit routes through it.
+  6. T1 user cancel / T2 peer cancel / T3 disconnect / T4 crash are
+     all covered: T1/T2/T3 by CleanupTransfer, T4 by the startup and
+     exit sweep plus a 60s no-reply -> auto pause.
+  7. Pause keeps the .part breakpoint for 30 minutes, then sweeps.
+  8. An occupied target names the owner process and PID.
+  9. Critical system processes are never terminated by the agent.
+ 10. Skipped entries are recorded in the ZIP archive comment and the
+     receiver always shows them.
+ 11. Frames are validated: magic, version, keyTag, length cap, CRC32.
+ 12. Landing names never contain \\ / : * ? " < > | or control chars.
+ 13. Both ends sanitize independently; the receiver trusts nothing.
+ 14. Reserved device names, trailing dot/space and NTFS ADS colons
+     are all handled.
+ 15. ZIP entry segments containing ".." or a drive root are skipped
+     and reported.
+ 16. All delivered sources are pure ASCII; Chinese only as \\uXXXX.
+
+Acceptance tests
+  A. Kill the agent with Task Manager, restart: zero leftover
+     ClipAgent_*.zip / *.part anywhere.
+  B. Cancel 10 times in a row: zero leftovers.
+  C. Unplug the vNIC for 1s, plug back: state returns to IDLE,
+     zero leftovers, user just presses Ctrl+Alt+V again.
+  D. Copy a folder, paste: lands as a single .zip, extracted by user.
+  E. Copy a 10GB file: peak memory stays flat, no OOM.
+  E2. Open the target file in Notepad, paste: the dialog names
+     notepad.exe (PID xxxx) and offers terminate/pause/skip/cancel.
+  E3. Target under a driver-protected path: ACCESS_DENIED path prints
+     the "check your minifilter/ObCallback" hint and never kills the
+     driver by itself.
+  F. Pause, then Ctrl+Alt+V: resumes from the breakpoint; rename is
+     retried when the .part is already complete.
+  G. Name traps: "..\\evil:stream.txt", "sub/a.txt", "CON.txt",
+     "a.txt." all land as safe single filenames inside outdir only.
+  H. build.bat under a non-Chinese system locale still compiles with
+     no C4819.
+
+Troubleshooting
+  WSAStartup / bind failed      : port in use, change --listen port.
+  hotkey unavailable            : another app owns Ctrl+Alt+V; the
+                                  tray menu still works.
+  advert send failed            : peer not connected, check run-guest.
+  crc/size mismatch             : transfer dropped, press Ctrl+Alt+V.
+  access denied on landing      : check protected dir, read-only
+                                  attribute, or your own minifilter.
+  timestamp service unreachable : signtool failed only; the unsigned
+                                  binary is kept and still runs.

@@ -1,0 +1,1236 @@
+// ClipAgent.cpp part 04 -- net loop, frames, streaming, args, entry.
+// ASCII only. // comments only. Chinese strings from part 03.
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <winsock2.h>
+
+// ---- part04-local helpers / state ----
+static volatile LONG  g_suppressClip = 0;
+static ULONGLONG      s_nextReq = 0;
+static ULONG          s_lastPct = 0;
+static SOCKET         s_listen  = INVALID_SOCKET;
+
+static ULONG NextRequestId(VOID)
+{
+    s_nextReq++;
+    if (!s_nextReq) s_nextReq = 1;
+    return (ULONG)s_nextReq ^ (ULONG)GetCurrentProcessId();
+}
+
+static BOOL Utf8FromWide(const WCHAR* w, char* out, ULONG cap)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (n <= 0 || (ULONG)n > cap) return FALSE;
+    return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap,
+                               NULL, NULL) > 0;
+}
+
+static VOID ProgressPost(ULONGLONG done, ULONGLONG total)
+{
+    ULONG pct;
+    if (!total) return;
+    pct = (ULONG)((done * 100ull) / total);
+    if (pct > 100u) pct = 100u;
+    if (pct == s_lastPct) return;
+    s_lastPct = pct;
+    if (g.hwnd) PostMessageW(g.hwnd, WM_APP_PROGRESS, (WPARAM)pct, 0);
+}
+
+static VOID SkipAdd(const char* rel, const char* why)
+{
+    char one[512];
+    size_t used;
+    StringCchPrintfA(one, 512, "skipped [%s]: %s\n", why ? why : "error",
+                     rel ? rel : "(unnamed)");
+    used = (size_t)lstrlenA(g.skipComment);
+    if (used + lstrlenA(one) < CLIPZIP_MAX_COMMENT - 1) {
+        StringCchCatA(g.skipComment, CLIPZIP_MAX_COMMENT, one);
+        g.skipCount++;
+    }
+}
+
+static BOOL TerminateOwner(VOID)
+{
+    HANDLE h;
+    WCHAR  w[64];
+    BOOL   ok = FALSE;
+    if (!g_choiceOwnerPid) return FALSE;
+    MultiByteToWideChar(CP_ACP, 0, g_choiceOwnerName, -1, w, 64);
+    if (ClipIsCriticalProcess(w)) {
+        Log(LOG_WARN, "refuse to terminate critical process");
+        return FALSE;
+    }
+    h = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)g_choiceOwnerPid);
+    if (!h) return FALSE;
+    ok = TerminateProcess(h, 1) ? TRUE : FALSE;
+    CloseHandle(h);
+    Log(ok ? LOG_OK : LOG_WARN, "terminate pid=%lu %s",
+        (ULONG)g_choiceOwnerPid, ok ? "ok" : "failed");
+    return ok;
+}
+
+// ============================================================
+// Advert scan
+// ============================================================
+static VOID AdvertScan(VOID)
+{
+    ULONGLONG seq = (ULONGLONG)GetClipboardSequenceNumber();
+    WCHAR**   paths = NULL;
+    ULONG     n = 0, i;
+    WCHAR*    txt = NULL;
+    ULONGLONG bytes = 0, total = 0, largest = 0;
+    ULONG     files = 0, dirs = 0;
+    WCHAR     base[MAX_PATH];
+
+    if (g.state == CLIP_TRANSFER || g.state == CLIP_PAUSED) return;
+    if (g.sock == INVALID_SOCKET || g.sock == 0) return;
+
+    if (InterlockedCompareExchange(&g_suppressClip, 0, 0) > 0) {
+        InterlockedDecrement(&g_suppressClip);
+        g.pendingClipSeq = seq;
+        return;
+    }
+    if (seq == g.pendingClipSeq) return;
+    g.pendingClipSeq = seq;
+
+    PendingClear();
+
+    if (ClipGetDropPaths(&paths, &n) && n) {
+        if (!PendingEnsure(n)) {
+            for (i = 0; i < n; i++)
+                FreeBuf(paths[i], (ULONG)(lstrlenW(paths[i]) + 1) * sizeof(WCHAR));
+            HeapFree(GetProcessHeap(), 0, paths);
+            return;
+        }
+        for (i = 0; i < n; i++) g.pendingPaths[i] = paths[i];
+        g.pendingCount = n;
+        HeapFree(GetProcessHeap(), 0, paths);
+        ClipCalcTotal(g.pendingPaths, g.pendingCount,
+                      &total, &largest, &files, &dirs);
+    } else if (ClipGetUnicodeText(&txt, &bytes)) {
+        g.pendingText = txt;
+        g.pendingTextBytes = bytes;
+        total = bytes;
+    } else {
+        return;
+    }
+
+    ZeroMemory(&g.pendingList, sizeof(g.pendingList));
+    g.pendingList.TotalBytes   = total;
+    g.pendingList.LargestBytes = largest;
+    g.pendingList.FileCount    = files;
+    g.pendingList.DirCount     = dirs;
+    g.pendingList.IsDir        = dirs ? 1u : 0u;
+    g.pendingList.Reserved     = 0;
+    g.pendingList.ClipSeq      = seq;
+    if (g.pendingCount && ClipSanitizeName(g.pendingPaths[0], base,
+                                           MAX_PATH, seq))
+        StringCchCopyW(g.pendingList.RootName, CLIP_NAME_W, base);
+    else if (g.pendingText)
+        StringCchCopyW(g.pendingList.RootName, CLIP_NAME_W,
+                       L"clipboard-text");
+
+    if (!NetSendFrame(FRAME_LIST, seq, &g.pendingList,
+                      (ULONG)sizeof(CLIP_LIST), &g.lastErr)) {
+        Log(LOG_WARN, "advert send failed err=%u", g.lastErr);
+        return;
+    }
+    TransferSetState(CLIP_HAVE_LIST);
+    {
+        char b[64];
+        ClipFormatBytes(total, b, 64);
+        Log(LOG_INFO, "advert: %s, files=%u dirs=%u", b, files, dirs);
+    }
+}
+
+// ============================================================
+// D2: pack one source into temp zip
+// ============================================================
+typedef struct _PACKCTX {
+    PCLIPZIP zip;
+    BOOL*    pCancel;
+    ULONG*   pEntries;
+} PACKCTX;
+
+static BOOL PackOne(PACKCTX* c, const WCHAR* full, const char* rel,
+                    ULONG depth);
+
+static BOOL PackDir(PACKCTX* c, const WCHAR* full, const char* relPrefix,
+                    ULONG depth)
+{
+    WCHAR  spec[MAX_PATH];
+    WCHAR  child[MAX_PATH];
+    WCHAR  safe[MAX_PATH];
+    char   relUtf8[CLIPZIP_MAX_ENTRY_UTF8];
+    char   seg[512];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+
+    if (depth > CLIP_MAX_DEPTH) {
+        SkipAdd(relPrefix, "depth-limit");
+        return TRUE;
+    }
+    StringCchPrintfW(spec, MAX_PATH, L"%s\\*", full);
+    h = FindFirstFileW(spec, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        SkipAdd(relPrefix, "dir-open");
+        return TRUE;
+    }
+    do {
+        if (!lstrcmpW(fd.cFileName, L".") ||
+            !lstrcmpW(fd.cFileName, L"..")) continue;
+        if (*c->pCancel) break;
+        if (!ClipSanitizeName(fd.cFileName, safe, MAX_PATH,
+                              (ULONGLONG)depth))
+            continue;
+        if (!Utf8FromWide(safe, seg, 512)) continue;
+        if (!lstrcmpA(seg, "..") || !lstrcmpA(seg, ".")) {
+            SkipAdd(seg, "zip-slip");
+            continue;
+        }
+        StringCchPrintfA(relUtf8, CLIPZIP_MAX_ENTRY_UTF8, "%s/%s",
+                         relPrefix, seg);
+        StringCchPrintfW(child, MAX_PATH, L"%s\\%s", full, fd.cFileName);
+        if (!PackOne(c, child, relUtf8, depth + 1)) {
+            FindClose(h);
+            return FALSE;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return TRUE;
+}
+
+static BOOL PackOne(PACKCTX* c, const WCHAR* full, const char* rel,
+                    ULONG depth)
+{
+    DWORD  a;
+    DWORD  err = ERROR_SUCCESS;
+    char   report[2048];
+    ULONG  ch;
+
+    if (*c->pCancel) return FALSE;
+    a = GetFileAttributesW(full);
+    if (a == INVALID_FILE_ATTRIBUTES) {
+        SkipAdd(rel, "stat-failed");
+        return TRUE;
+    }
+    if (a & FILE_ATTRIBUTE_DIRECTORY)
+        return PackDir(c, full, rel, depth);
+
+    if (ClipZipAddFile(c->zip, full, rel, &err)) {
+        (*c->pEntries)++;
+        return TRUE;
+    }
+
+    ClipClassifyAndReport(full, err, report, 2048);
+    ch = AskUserChoice(report);
+
+    if (ch == CH_CANCEL) {
+        *c->pCancel = TRUE;
+        return FALSE;
+    }
+    if (ch == CH_TERM) {
+        TerminateOwner();
+        err = ERROR_SUCCESS;
+        if (ClipZipAddFile(c->zip, full, rel, &err)) {
+            (*c->pEntries)++;
+            return TRUE;
+        }
+        SkipAdd(rel, "retry-after-terminate");
+        return TRUE;
+    }
+    if (ch == CH_RESUME) {
+        err = ERROR_SUCCESS;
+        if (ClipZipAddFile(c->zip, full, rel, &err)) {
+            (*c->pEntries)++;
+            return TRUE;
+        }
+        SkipAdd(rel, "retry-failed");
+        return TRUE;
+    }
+    SkipAdd(rel, ch == CH_TIMEOUT ? "timeout" : "user-skip");
+    Log(LOG_WARN, "packing skipped one entry: %s (choice=%u)", rel, ch);
+    return TRUE;
+}
+
+// ============================================================
+// Cancel emission
+// ============================================================
+static VOID EmitCancelAndCleanup(CLIP_REASON reason)
+{
+    CLIP_CANCEL c;
+    ZeroMemory(&c, sizeof(c));
+    c.Reason    = (ULONG)reason;
+    c.RequestId = g.requestId;
+    if (g.sock != INVALID_SOCKET && g.sock != 0)
+        NetSendFrame(FRAME_CANCEL, g.requestId, &c,
+                     (ULONG)sizeof(CLIP_CANCEL), &g.lastErr);
+    CleanupTransfer(reason, FALSE);
+}
+
+// ============================================================
+// Sender
+// ============================================================
+BOOL BuildAndSendPayload(ULONGLONG requestId, BOOL resume)
+{
+    CLIP_ZIP_START zs;
+    CLIP_ZIP_END   ze;
+    HANDLE    hSrc = INVALID_HANDLE_VALUE;
+    BYTE*     buf = NULL;
+    ULONGLONG finalSize = 0, off = 0;
+    ULONG     crc = 0xFFFFFFFFu;
+    ULONG     entries = 0, sent = 0;
+    BOOL      cancel = FALSE, ok = FALSE;
+    DWORD     err = ERROR_SUCCESS;
+    ULONG     seqNo = 0;
+    PACKCTX   pc;
+
+    s_lastPct = 0;
+    if (g.sock == INVALID_SOCKET || g.sock == 0) return FALSE;
+    if (!g.pendingCount && !g.pendingText) {
+        Log(LOG_WARN, "nothing to paste (no local clipboard advert)");
+        return FALSE;
+    }
+    if (resume && !g.zipTemp[0]) resume = FALSE;
+
+    if (!resume) {
+        CleanupTransfer(CLIP_R_OK, FALSE);
+        g.requestId   = requestId ? requestId : (ULONGLONG)NextRequestId();
+        g.bytesDone   = 0;
+        g.blockSeq    = 0;
+        g.skipCount   = 0;
+        g.skipComment[0] = '\0';
+        g.textMode    = (g.pendingText != NULL) && (g.pendingCount == 0);
+
+        if (!g.textMode) {
+            ULONGLONG tag = (ULONGLONG)GetTickCount64();
+            if (!ClipMakeTempName(g.zipTemp, MAX_PATH,
+                                  L".zip", tag) ||
+                !ClipMakeTempName(g.cdTemp, MAX_PATH,
+                                  L".cd", tag)) {
+                Log(LOG_ERR, "temp name failed");
+                return FALSE;
+            }
+            if (!ClipZipCreate(&g.zip, g.zipTemp, g.cdTemp)) {
+                Log(LOG_ERR, "zip create failed");
+                EmitCancelAndCleanup(CLIP_R_PATH);
+                return FALSE;
+            }
+            InterlockedExchange(&g.zip.Abort, 0);
+
+            pc.zip      = &g.zip;
+            pc.pCancel  = &cancel;
+            pc.pEntries = &entries;
+            {
+                WCHAR  safe[MAX_PATH];
+                char   rel[CLIPZIP_MAX_ENTRY_UTF8];
+                ULONG  i;
+                for (i = 0; i < g.pendingCount && !cancel; i++) {
+                    if (!ClipSanitizeName(g.pendingPaths[i], safe,
+                                          MAX_PATH, i)) continue;
+                    if (!Utf8FromWide(safe, rel,
+                                      CLIPZIP_MAX_ENTRY_UTF8)) continue;
+                    if (!PackOne(&pc, g.pendingPaths[i], rel, 0)) break;
+                }
+            }
+            if (cancel) {
+                ClipZipAbort(&g.zip);
+                EmitCancelAndCleanup(CLIP_R_USER_CANCEL);
+                return FALSE;
+            }
+            if (g.skipCount)
+                ClipZipSetComment(&g.zip, g.skipComment);
+            if (!ClipZipFinalize(&g.zip, &finalSize)) {
+                Log(LOG_ERR, "zip finalize failed");
+                ClipZipAbort(&g.zip);
+                EmitCancelAndCleanup(CLIP_R_DISK_FULL);
+                return FALSE;
+            }
+            g.bytesTotal = finalSize;
+        } else {
+            g.bytesTotal = g.pendingTextBytes;
+        }
+    } else {
+        g.bytesTotal = g.zipTemp[0] ? g.bytesTotal : g.pendingTextBytes;
+        InterlockedExchange(&g.zip.Abort, 0);
+        Log(LOG_INFO, "resume from %I64u / %I64u bytes",
+            g.bytesDone, g.bytesTotal);
+    }
+
+    buf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, CLIP_CHUNK_SIZE);
+    if (!buf) {
+        EmitCancelAndCleanup(CLIP_R_DISK_FULL);
+        return FALSE;
+    }
+
+    ZeroMemory(&zs, sizeof(zs));
+    zs.ZipBytes   = g.bytesTotal;
+    zs.EntryCount = g.textMode ? 0u : entries;
+    zs.Reserved   = 0;
+    if (!g.textMode) {
+        WCHAR safe[MAX_PATH];
+        if (g.pendingCount &&
+            ClipSanitizeName(g.pendingPaths[0], safe, MAX_PATH, 0)) {
+            WCHAR* d = safe;
+            for (WCHAR* p = safe; *p; p++) if (*p == L'.') d = p;
+            if (d != safe) *d = L'\0';
+            StringCchPrintfW(zs.FileName, CLIP_NAME_W, L"%s.zip", safe);
+        } else {
+            StringCchCopyW(zs.FileName, CLIP_NAME_W, L"clipboard.zip");
+        }
+    } else {
+        zs.FileName[0] = L'\0';
+    }
+    if (!NetSendFrame(FRAME_ZIP_START, g.requestId, &zs,
+                      (ULONG)sizeof(CLIP_ZIP_START), &err)) {
+        Log(LOG_ERR, "zip-start send failed err=%u", err);
+        goto fail;
+    }
+
+    TransferSetState(CLIP_TRANSFER);
+
+    if (!g.textMode) {
+        hSrc = CreateFileW(g.zipTemp, GENERIC_READ, FILE_SHARE_READ,
+                           NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL |
+                           FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (hSrc == INVALID_HANDLE_VALUE) {
+            Log(LOG_ERR, "open temp zip failed err=%u", GetLastError());
+            goto fail;
+        }
+        if (g.bytesDone) {
+            LARGE_INTEGER li;
+            li.QuadPart = (LONGLONG)g.bytesDone;
+            if (!SetFilePointerEx(hSrc, li, NULL, FILE_BEGIN)) goto fail;
+        }
+    }
+
+    off = g.bytesDone;
+    seqNo = (ULONG)(off / CLIP_CHUNK_SIZE);
+    while (off < g.bytesTotal) {
+        ULONG want = (ULONG)((g.bytesTotal - off > CLIP_CHUNK_SIZE)
+                             ? CLIP_CHUNK_SIZE
+                             : (g.bytesTotal - off));
+        DWORD got = 0;
+
+        if (TransferIsAborted()) {
+            EmitCancelAndCleanup(CLIP_R_USER_CANCEL);
+            goto done;
+        }
+        if (g.textMode) {
+            CopyMemory(buf, (const BYTE*)g.pendingText + off, want);
+            got = want;
+        } else {
+            if (!ReadFile(hSrc, buf, want, &got, NULL) || got == 0) {
+                Log(LOG_ERR, "read temp zip failed err=%u", GetLastError());
+                goto fail;
+            }
+        }
+        crc = ClipCrc32(crc, buf, got);
+        if (!NetSendFrame(FRAME_DATA, (ULONGLONG)seqNo,
+                          buf, got, &err)) {
+            Log(LOG_ERR, "data send failed err=%u", err);
+            goto fail;
+        }
+        off += got;
+        g.bytesDone = off;
+        g.blockSeq  = (ULONGLONG)seqNo + 1;
+        seqNo++;
+        sent += got;
+        ProgressPost(off, g.bytesTotal);
+    }
+
+    ZeroMemory(&ze, sizeof(ze));
+    ze.WholeCrc32   = ~crc;
+    ze.SkippedCount = g.skipCount;
+    ze.SkippedBytes = 0;
+    ze.Reserved     = 0;
+    if (!NetSendFrame(FRAME_ZIP_END, g.requestId, &ze,
+                      (ULONG)sizeof(CLIP_ZIP_END), &err)) {
+        Log(LOG_ERR, "zip-end send failed err=%u", err);
+        goto fail;
+    }
+    ok = TRUE;
+
+fail:
+    if (!ok) {
+        if (hSrc != INVALID_HANDLE_VALUE) {
+            CloseHandle(hSrc);
+            hSrc = INVALID_HANDLE_VALUE;
+        }
+        ClipZipAbort(&g.zip);
+        Log(LOG_WARN, "sender cleaned, %I64u bytes delivered", g.bytesDone);
+        CleanupTransfer(CLIP_R_DISCONNECT, FALSE);
+    }
+done:
+    if (hSrc != INVALID_HANDLE_VALUE) CloseHandle(hSrc);
+    if (buf) {
+        ZeroMemory(buf, CLIP_CHUNK_SIZE);
+        HeapFree(GetProcessHeap(), 0, buf);
+    }
+    if (ok || g.state == CLIP_IDLE) {
+        ClipZipAbort(&g.zip);
+        CleanupTransfer(CLIP_R_OK, FALSE);
+        Log(LOG_OK, "sent %I64u bytes, skipped=%u", sent, g.skipCount);
+    }
+    return ok;
+}
+
+// ============================================================
+// Receiver
+// ============================================================
+BOOL ReceiverBegin(const CLIP_ZIP_START* s)
+{
+    WCHAR target[MAX_PATH];
+    WCHAR finalName[MAX_PATH];
+    WCHAR safe[MAX_PATH];
+    ULONGLONG tag;
+    char  report[2048];
+    ULONG ch;
+
+    if (!s) return FALSE;
+    if (g.state == CLIP_TRANSFER) {
+        Log(LOG_WARN, "zip-start while transferring, ignored");
+        return FALSE;
+    }
+    g.requestId   = (s->ZipBytes << 8) ^ (ULONGLONG)GetTickCount64();
+    g.bytesTotal  = s->ZipBytes;
+    g.bytesDone   = 0;
+    g.blockSeq    = 0;
+    g.wholeCrc    = 0xFFFFFFFFu;
+    g.lastErr     = ERROR_SUCCESS;
+    g.textMode    = (s->FileName[0] == L'\0');
+    s_lastPct     = 0;
+    if (g.hPart) { CloseHandle(g.hPart); g.hPart = NULL; }
+
+    if (g.textMode &&
+        g.bytesTotal > (ULONGLONG)CLIP_MAX_TEXT_WCH * sizeof(WCHAR)) {
+        Log(LOG_ERR, "text payload too large, rejected");
+        EmitCancelAndCleanup(CLIP_R_PATH);
+        return FALSE;
+    }
+
+    if (!ClipGetForegroundDir(target, MAX_PATH)) {
+        StringCchCopyW(target, MAX_PATH, g.outDir);
+    }
+    if (!ClipEnsureDir(target)) {
+        StringCchCopyW(target, MAX_PATH, g.outDir);
+        ClipEnsureDir(target);
+    }
+    if (!ClipCheckDiskSpace(target, g.bytesTotal + 1048576ull)) {
+        ClipClassifyAndReport(target, ERROR_DISK_FULL, report, 2048);
+        ch = AskUserChoice(report);
+        if (ch == CH_CANCEL || ch == CH_TIMEOUT || ch == CH_SKIP) {
+            EmitCancelAndCleanup(CLIP_R_DISK_FULL);
+            return FALSE;
+        }
+    }
+
+    tag = (ULONGLONG)GetTickCount64();
+    if (!ClipMakeTempName(g.partPath, MAX_PATH, L".part", tag)) {
+        StringCchPrintfW(g.partPath, MAX_PATH,
+            L"%s\\ClipAgent_%lu_%I64u.part", target,
+            (ULONG)GetCurrentProcessId(), tag);
+    }
+
+    if (!g.textMode) {
+        if (!ClipSanitizeName(s->FileName, safe, MAX_PATH, tag)) {
+            EmitCancelAndCleanup(CLIP_R_PATH);
+            return FALSE;
+        }
+        StringCchCopyW(finalName, MAX_PATH, safe);
+        StringCchPrintfW(g.finalPath, MAX_PATH, L"%s\\%s",
+                         target, finalName);
+    } else {
+        g.finalPath[0] = L'\0';
+    }
+
+    g.hPart = CreateFileW(g.partPath, GENERIC_WRITE | FILE_APPEND_DATA,
+                          FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                          FILE_ATTRIBUTE_TEMPORARY |
+                          FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (g.hPart == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        ClipClassifyAndReport(g.partPath, e, report, 2048);
+        Log(LOG_ERR, "create .part failed err=%u", e);
+        ch = AskUserChoice(report);
+        if (ch == CH_TERM) TerminateOwner();
+        if (ch == CH_CANCEL || ch == CH_TIMEOUT) {
+            EmitCancelAndCleanup(CLIP_R_ACCESS);
+            return FALSE;
+        }
+        g.hPart = CreateFileW(g.partPath,
+                              GENERIC_WRITE | FILE_APPEND_DATA,
+                              FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_TEMPORARY, NULL);
+        if (g.hPart == INVALID_HANDLE_VALUE) {
+            EmitCancelAndCleanup(CLIP_R_ACCESS);
+            return FALSE;
+        }
+    }
+
+    TransferSetState(CLIP_TRANSFER);
+    {
+        char b[64];
+        ClipFormatBytes(g.bytesTotal, b, 64);
+        Log(LOG_INFO, "receiving %s -> %s%s", b,
+            g.textMode ? "(clipboard text)" : "file",
+            g.textMode ? "" : " (part staged)");
+    }
+    return TRUE;
+}
+
+BOOL ReceiverWriteChunk(ULONGLONG seq, const BYTE* p, ULONG n)
+{
+    DWORD wrote = 0;
+    if (!p || !n) return FALSE;
+    if (g.state != CLIP_TRANSFER) return FALSE;
+
+    if (!g.hPart && g.partPath[0]) {
+        g.hPart = CreateFileW(g.partPath, FILE_APPEND_DATA,
+                              FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_TEMPORARY, NULL);
+        if (g.hPart == INVALID_HANDLE_VALUE) {
+            g.hPart = NULL;
+            return FALSE;
+        }
+    }
+    if (!WriteFile(g.hPart, p, n, &wrote, NULL) || wrote != n)
+        return FALSE;
+
+    g.wholeCrc  = ClipCrc32(g.wholeCrc, p, n);
+    g.bytesDone += n;
+    g.blockSeq   = seq + 1;
+    ProgressPost(g.bytesDone, g.bytesTotal);
+    return TRUE;
+}
+
+static BOOL ReceiverRetryRename(VOID)
+{
+    char report[2048];
+    DWORD moveErr;
+    if (!g.partPath[0] || !g.finalPath[0]) return FALSE;
+    if (MoveFileExW(g.partPath, g.finalPath,
+                    MOVEFILE_REPLACE_EXISTING)) {
+        Log(LOG_OK, "rename succeeded after resume");
+        CleanupTransfer(CLIP_R_OK, FALSE);
+        return TRUE;
+    }
+    moveErr = GetLastError();
+    ClipClassifyAndReport(g.finalPath, moveErr, report, 2048);
+    Log(LOG_ERR, "rename failed again err=%u, transfer dropped", moveErr);
+    EmitCancelAndCleanup(CLIP_R_ACCESS);
+    return FALSE;
+}
+
+BOOL ReceiverFinish(const CLIP_ZIP_END* e)
+{
+    char  comment[CLIPZIP_MAX_COMMENT];
+    char  report[2048];
+    ULONG ch;
+    DWORD moveErr;
+
+    if (!e) return FALSE;
+    if (g.hPart) { CloseHandle(g.hPart); g.hPart = NULL; }
+
+    if (g.bytesDone != g.bytesTotal || (~g.wholeCrc) != e->WholeCrc32) {
+        Log(LOG_ERR, "crc/size mismatch: got=%I64u want=%I64u",
+            g.bytesDone, g.bytesTotal);
+        EmitCancelAndCleanup(CLIP_R_PEER_CANCEL);
+        return FALSE;
+    }
+
+    if (g.textMode) {
+        HANDLE h = CreateFileW(g.partPath, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        BYTE*  tb = NULL;
+        DWORD  got = 0, n = (DWORD)g.bytesTotal;
+        if (h != INVALID_HANDLE_VALUE) {
+            tb = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                  (SIZE_T)n + 2);
+            if (tb) {
+                ReadFile(h, tb, n, &got, NULL);
+                CloseHandle(h);
+                ((WCHAR*)tb)[got / 2] = L'\0';
+                InterlockedExchange(&g_suppressClip, 2);
+                ClipSetUnicodeText((const WCHAR*)tb);
+                ZeroMemory(tb, n + 2);
+                HeapFree(GetProcessHeap(), 0, tb);
+                Log(LOG_OK, "text pasted to local clipboard (%u bytes)", got);
+            } else {
+                CloseHandle(h);
+            }
+        }
+        CleanupTransfer(CLIP_R_OK, FALSE);
+        return TRUE;
+    }
+
+    while (!MoveFileExW(g.partPath, g.finalPath,
+                        MOVEFILE_REPLACE_EXISTING)) {
+        moveErr = GetLastError();
+        ClipClassifyAndReport(g.finalPath, moveErr, report, 2048);
+        ch = AskUserChoice(report);
+        if (ch == CH_CANCEL) {
+            EmitCancelAndCleanup(CLIP_R_USER_CANCEL);
+            return FALSE;
+        }
+        if (ch == CH_TERM) { TerminateOwner(); continue; }
+        if (ch == CH_TIMEOUT || ch == CH_SKIP) {
+            CLIP_PAUSE p;
+            ZeroMemory(&p, sizeof(p));
+            p.Reason     = (ULONG)CLIP_R_PAUSE_KEEP;
+            p.ErrClass   = ClipClassifyError(moveErr);
+            p.Win32Error = moveErr;
+            p.RequestId  = g.requestId;
+            StringCchCopyW(p.Subject, CLIP_NAME_W, g.finalPath);
+            PauseTransfer(&p);
+            return FALSE;
+        }
+        break;
+    }
+
+    if (g.partPath[0] && GetFileAttributesW(g.partPath) != INVALID_FILE_ATTRIBUTES) {
+        DWORD renameErr = GetLastError();
+        CLIP_PAUSE p;
+        ZeroMemory(&p, sizeof(p));
+        p.Reason     = (ULONG)CLIP_R_PAUSE_KEEP;
+        p.ErrClass   = CLIPERR_ACCESS;
+        p.Win32Error = renameErr;
+        p.RequestId  = g.requestId;
+        StringCchCopyW(p.Subject, CLIP_NAME_W, g.finalPath);
+        PauseTransfer(&p);
+        return FALSE;
+    }
+
+    comment[0] = '\0';
+    if (ClipZipReadComment(g.finalPath, comment, CLIPZIP_MAX_COMMENT))
+        ClipShowSkipList(comment);
+
+    {
+        char b[64];
+        ClipFormatBytes(g.bytesTotal, b, 64);
+        Log(LOG_OK, "saved %s (%s)", "file", b);
+    }
+    CleanupTransfer(CLIP_R_OK, FALSE);
+    return TRUE;
+}
+
+// ============================================================
+// Frame dispatch
+// ============================================================
+BOOL HandleFrame(const CLIP_FRAME_HEADER* h, const BYTE* payload)
+{
+    if (!h) return FALSE;
+    switch (h->Type) {
+    case FRAME_HELLO:
+        Log(LOG_OK, "peer hello accepted");
+        return TRUE;
+
+    case FRAME_LIST:
+        if (h->Length < sizeof(CLIP_LIST)) return FALSE;
+        CopyMemory(&g.pendingList, payload, sizeof(CLIP_LIST));
+        if (g.state == CLIP_IDLE) TransferSetState(CLIP_HAVE_LIST);
+        {
+            char b[64];
+            ClipFormatBytes(g.pendingList.TotalBytes, b, 64);
+            Log(LOG_INFO, "remote content ready: %s, files=%u dirs=%u",
+                b, g.pendingList.FileCount, g.pendingList.DirCount);
+        }
+        return TRUE;
+
+    case FRAME_PULL:
+        if (h->Length < sizeof(CLIP_PULL)) return FALSE;
+        return HandlePull((const CLIP_PULL*)payload);
+
+    case FRAME_ZIP_START:
+        if (h->Length < sizeof(CLIP_ZIP_START)) return FALSE;
+        return ReceiverBegin((const CLIP_ZIP_START*)payload);
+
+    case FRAME_DATA:
+        return ReceiverWriteChunk(h->Seq, payload, h->Length);
+
+    case FRAME_ZIP_END:
+        if (h->Length < sizeof(CLIP_ZIP_END)) return FALSE;
+        return ReceiverFinish((const CLIP_ZIP_END*)payload);
+
+    case FRAME_CANCEL: {
+        const CLIP_CANCEL* c = (const CLIP_CANCEL*)payload;
+        ULONG r = (h->Length >= sizeof(CLIP_CANCEL) && c)
+                  ? c->Reason : (ULONG)CLIP_R_PEER_CANCEL;
+        {
+            CLIP_CANCEL ack;
+            ZeroMemory(&ack, sizeof(ack));
+            ack.Reason    = r;
+            ack.RequestId = g.requestId;
+            NetSendFrame(FRAME_CANCEL_ACK, g.requestId, &ack,
+                         (ULONG)sizeof(CLIP_CANCEL), &g.lastErr);
+        }
+        CleanupTransfer(CLIP_R_PEER_CANCEL, FALSE);
+        Log(LOG_WARN, "peer canceled (reason=%u)", r);
+        return TRUE;
+    }
+
+    case FRAME_CANCEL_ACK:
+        Log(LOG_INFO, "cancel ack received");
+        return TRUE;
+
+    case FRAME_PAUSE: {
+        const CLIP_PAUSE* p = (const CLIP_PAUSE*)payload;
+        if (h->Length >= sizeof(CLIP_PAUSE) && p)
+            CopyMemory(&g.pauseInfo, p, sizeof(CLIP_PAUSE));
+        CleanupTransfer(CLIP_R_PAUSE_KEEP, TRUE);
+        TransferSetState(CLIP_PAUSED);
+        Log(LOG_WARN, "peer paused transfer, breakpoint kept");
+        return TRUE;
+    }
+
+    case FRAME_RESUME: {
+        const CLIP_RESUME* r = (const CLIP_RESUME*)payload;
+        ULONG act = (h->Length >= sizeof(CLIP_RESUME) && r)
+                    ? r->Action : 0u;
+        InterlockedExchange(&g.abort, 0);
+        InterlockedExchange(&g.zip.Abort, 0);
+        TransferSetState(CLIP_TRANSFER);
+        if (g.zipTemp[0]) {
+            BuildAndSendPayload(g.requestId, TRUE);
+        } else if (g.partPath[0] && g.finalPath[0] &&
+                   g.bytesDone == g.bytesTotal) {
+            ReceiverRetryRename();
+        } else {
+            if (g.hPart) { CloseHandle(g.hPart); g.hPart = NULL; }
+        }
+        Log(LOG_OK, "peer resumed (action=%u)", act);
+        return TRUE;
+    }
+
+    case FRAME_SKIP_LIST:
+        Log(LOG_WARN, "peer reported skipped entries");
+        return TRUE;
+
+    default:
+        Log(LOG_WARN, "unknown frame type 0x%04X ignored", h->Type);
+        return TRUE;
+    }
+}
+
+BOOL HandlePull(const CLIP_PULL* p)
+{
+    ULONGLONG total = 0, largest = 0;
+    ULONG     files = 0, dirs = 0;
+    char      report[2048];
+    char      b1[64], b2[64];
+    ULONG     ch;
+
+    if (!p) return FALSE;
+    if (g.state == CLIP_TRANSFER) {
+        Log(LOG_WARN, "pull ignored: transfer already running");
+        return FALSE;
+    }
+    if (!g.pendingCount && !g.pendingText) {
+        Log(LOG_WARN, "pull ignored: nothing on local clipboard");
+        return FALSE;
+    }
+
+    if (g.pendingText && !g.pendingCount)
+        total = g.pendingTextBytes;
+    else
+        ClipCalcTotal(g.pendingPaths, g.pendingCount,
+                      &total, &largest, &files, &dirs);
+
+    if (total > (ULONGLONG)g.maxFileMb * 1048576ull) {
+        ClipFormatBytes(total, b1, 64);
+        StringCchPrintfA(b2, 64, "%u MB", g.maxFileMb);
+        StringCchPrintfA(report, 2048,
+            "content is %s, configured limit is %s\r\n"
+            "files=%u dirs=%u\r\n"
+            "continue anyway? (choose CONTINUE or CANCEL)\r\n",
+            b1, b2, files, dirs);
+        ch = AskUserChoice(report);
+        if (ch != CH_RESUME) {
+            Log(LOG_WARN, "large content declined by user (%s)", b1);
+            EmitCancelAndCleanup(CLIP_R_USER_CANCEL);
+            return FALSE;
+        }
+    } else if (total > (ULONGLONG)g.confirmMb * 1048576ull) {
+        ClipFormatBytes(total, b1, 64);
+        Log(LOG_WARN, "large paste %s (above %u MB warn level)",
+            b1, g.confirmMb);
+    }
+
+    g.requestId = p->RequestId ? p->RequestId
+                               : (ULONGLONG)NextRequestId();
+    return BuildAndSendPayload(g.requestId, (p->Flags & 1u) ? TRUE : FALSE);
+}
+
+// ============================================================
+// Network thread
+// ============================================================
+static BOOL SetSockTimeouts(SOCKET s)
+{
+    DWORD t = CLIP_SO_TIMEOUT_MS;
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char*)&t, sizeof(t)) == SOCKET_ERROR) return FALSE;
+    if (setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+                   (const char*)&t, sizeof(t)) == SOCKET_ERROR) return FALSE;
+    return TRUE;
+}
+
+static BOOL SendHello(SOCKET s)
+{
+    CLIP_HELLO h;
+    DWORD sz = CLIP_NAME_W;
+    ZeroMemory(&h, sizeof(h));
+    h.Pid      = (ULONG)GetCurrentProcessId();
+    h.Role     = g.isHost ? 1 : 2;
+    h.Reserved = 0;
+    if (!GetComputerNameW(h.Machine, &sz))
+        StringCchCopyW(h.Machine, CLIP_NAME_W, L"unknown");
+    return NetSendFrame(FRAME_HELLO, 1, &h,
+                        (ULONG)sizeof(CLIP_HELLO), &g.lastErr);
+}
+
+static BOOL ConnectAsGuest(VOID)
+{
+    SOCKET s;
+    SOCKADDR_IN a;
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return FALSE;
+    ZeroMemory(&a, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port   = htons(g.port);
+    a.sin_addr.S_un.S_addr = inet_addr(g.peerHost);
+    if (a.sin_addr.S_un.S_addr == INADDR_NONE) {
+        Log(LOG_ERR, "bad IPv4 address: %s", g.peerHost);
+        closesocket(s);
+        return FALSE;
+    }
+    if (connect(s, (SOCKADDR*)&a, sizeof(a)) == SOCKET_ERROR) {
+        Log(LOG_ERR, "connect to %s:%u failed wsa=%u",
+            g.peerHost, (ULONG)g.port, (ULONG)WSAGetLastError());
+        closesocket(s);
+        return FALSE;
+    }
+    if (!SetSockTimeouts(s)) { closesocket(s); return FALSE; }
+    g.sock = s;
+    Log(LOG_OK, "connected to %s:%u", g.peerHost, (ULONG)g.port);
+    SendHello(s);
+    return TRUE;
+}
+
+static BOOL ListenAsHost(VOID)
+{
+    SOCKADDR_IN a;
+    s_listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s_listen == INVALID_SOCKET) return FALSE;
+    {
+        int one = 1;
+        setsockopt(s_listen, SOL_SOCKET, SO_REUSEADDR,
+                   (const char*)&one, sizeof(one));
+    }
+    ZeroMemory(&a, sizeof(a));
+    a.sin_family      = AF_INET;
+    a.sin_port        = htons(g.port);
+    a.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
+    if (bind(s_listen, (SOCKADDR*)&a, sizeof(a)) == SOCKET_ERROR) {
+        Log(LOG_ERR, "bind port %u failed wsa=%u",
+            (ULONG)g.port, (ULONG)WSAGetLastError());
+        closesocket(s_listen);
+        s_listen = INVALID_SOCKET;
+        return FALSE;
+    }
+    if (listen(s_listen, 1) == SOCKET_ERROR) {
+        closesocket(s_listen);
+        s_listen = INVALID_SOCKET;
+        return FALSE;
+    }
+    Log(LOG_INFO, "listening on port %u", (ULONG)g.port);
+    return TRUE;
+}
+
+static VOID TickKicks(VOID)
+{
+    if (InterlockedCompareExchange(&g_clipPullKick, 0, 0)) {
+        InterlockedExchange(&g_clipPullKick, 0);
+        if (g.sock == INVALID_SOCKET || g.sock == 0) {
+            Log(LOG_WARN, "paste ignored: not connected");
+        } else if (g.state == CLIP_TRANSFER) {
+            Log(LOG_WARN, "paste ignored: transfer in progress");
+        } else {
+            CLIP_PULL p;
+            ZeroMemory(&p, sizeof(p));
+            p.RequestId = (ULONGLONG)NextRequestId();
+            p.MaxFileMb = g.maxFileMb;
+            p.Flags     = 0;
+            if (NetSendFrame(FRAME_PULL, p.RequestId, &p,
+                             (ULONG)sizeof(CLIP_PULL), &g.lastErr))
+                Log(LOG_INFO, "Ctrl+Alt+V -> FRAME_PULL sent");
+            else
+                Log(LOG_ERR, "pull send failed err=%u", g.lastErr);
+        }
+    }
+
+    if (InterlockedCompareExchange(&g_clipResumeKick, 0, 0)) {
+        InterlockedExchange(&g_clipResumeKick, 0);
+        if (g.zipTemp[0]) {
+            BuildAndSendPayload(g.requestId, TRUE);
+        } else if (g.partPath[0] && g.finalPath[0] &&
+                   g.bytesDone == g.bytesTotal) {
+            ReceiverRetryRename();
+        } else {
+            Log(LOG_INFO, "resume: waiting for peer FRAME_DATA");
+        }
+    }
+
+    if (TransferIsAborted() && g.state == CLIP_TRANSFER) {
+        EmitCancelAndCleanup(CLIP_R_USER_CANCEL);
+    }
+}
+
+DWORD WINAPI NetThread(LPVOID p)
+{
+    BYTE* payload = NULL;
+    (void)p;
+
+    payload = (BYTE*)HeapAlloc(GetProcessHeap(), 0,
+                               CLIP_MAX_FRAME_PAYLOAD);
+    if (!payload) {
+        Log(LOG_ERR, "net thread alloc failed");
+        return 1;
+    }
+
+    if (g.isHost) {
+        if (!ListenAsHost()) goto out;
+    } else {
+        if (!ConnectAsGuest()) goto out;
+    }
+
+    while (InterlockedCompareExchange(&g.netRunning, 0, 0)) {
+        fd_set rd;
+        struct timeval tv;
+        CLIP_FRAME_HEADER h;
+        ULONG  len = 0;
+        DWORD  err = ERROR_SUCCESS;
+        int    r;
+
+        TickKicks();
+        if (g.sock == INVALID_SOCKET || g.sock == 0) {
+            if (g.isHost && s_listen != INVALID_SOCKET) {
+                FD_ZERO(&rd);
+                FD_SET(s_listen, &rd);
+                tv.tv_sec = 0; tv.tv_usec = 200000;
+                r = select(0, &rd, NULL, NULL, &tv);
+                if (r > 0) {
+                    SOCKET a = accept(s_listen, NULL, NULL);
+                    if (a != INVALID_SOCKET) {
+                        SetSockTimeouts(a);
+                        g.sock = a;
+                        Log(LOG_OK, "guest connected");
+                        SendHello(a);
+                    }
+                }
+            } else if (!g.isHost) {
+                Sleep(200);
+                if (!ConnectAsGuest()) Sleep(1000);
+            }
+            continue;
+        }
+
+        AdvertScan();
+        FD_ZERO(&rd);
+        FD_SET(g.sock, &rd);
+        tv.tv_sec = 0; tv.tv_usec = 200000;
+        r = select(0, &rd, NULL, NULL, &tv);
+        if (r == 0) continue;
+        if (r == SOCKET_ERROR) {
+            HandleDisconnect((DWORD)WSAGetLastError());
+            break;
+        }
+
+        ZeroMemory(payload, CLIP_MAX_FRAME_PAYLOAD);
+        r = NetRecvFrame(&h, payload, CLIP_MAX_FRAME_PAYLOAD,
+                         &len, &err);
+        if (r == -1) {
+            HandleDisconnect(CLIP_NET_CLOSED);
+            break;
+        }
+        if (r == 0) {
+            HandleDisconnect(err);
+            break;
+        }
+        if (!HandleFrame(&h, payload)) {
+            Log(LOG_WARN, "frame handler failed type=0x%04X", h.Type);
+        }
+        ZeroMemory(payload, len);
+    }
+
+out:
+    if (s_listen != INVALID_SOCKET) {
+        closesocket(s_listen);
+        s_listen = INVALID_SOCKET;
+    }
+    if (g.sock != INVALID_SOCKET && g.sock != 0) {
+        shutdown(g.sock, SD_BOTH);
+        closesocket(g.sock);
+        g.sock = INVALID_SOCKET;
+    }
+    if (payload) {
+        ZeroMemory(payload, CLIP_MAX_FRAME_PAYLOAD);
+        HeapFree(GetProcessHeap(), 0, payload);
+    }
+    Log(LOG_INFO, "net thread stopped");
+    return 0;
+}
+
+// ============================================================
+// Args + entry
+// ============================================================
+static VOID PrintUsage(VOID)
+{
+    printf(
+      "ClipAgent (pull model, Win7/Win11 x64)\n"
+      "  HOST : ClipAgent.exe --listen 8080 --key mon --outdir C:\\ClipInbox\n"
+      "  GUEST: ClipAgent.exe --connect 192.168.1.50:8080 --key mon"
+      " --outdir C:\\ClipInbox\n"
+      "\n"
+      "  --key <s>           shared LAN label (default mon)\n"
+      "  --outdir <dir>      fallback landing dir\n"
+      "  --max-file-mb <n>   ask before sending above n MB (default 256)\n"
+      "  --confirm-mb <n>    warn level (default 50)\n"
+      "  --quiet             hide console, tray only\n"
+      "  --help              this text\n"
+      "\n"
+      "  Ctrl+Alt+V  paste remote content (PULL)\n"
+      "  Ctrl+Alt+C  cancel current transfer\n"
+      "  Ctrl+Alt+S  show/hide log window\n"
+    );
+}
+
+BOOL ParseArgs(int argc, WCHAR** argv)
+{
+    int i;
+    BOOL haveMode = FALSE;
+
+    StringCchCopyA(g.key, CLIP_KEY_MAX, "mon");
+    StringCchCopyW(g.outDir, MAX_PATH, L"C:\\ClipInbox");
+    g.port       = CLIP_DEFAULT_PORT;
+    g.maxFileMb  = CLIP_MAX_FILE_DEFAULT_MB;
+    g.confirmMb  = CLIP_CONFIRM_DEFAULT_MB;
+    g.quiet      = FALSE;
+    g.isHost     = FALSE;
+    g.peerHost[0] = '\0';
+
+    for (i = 1; i < argc; i++) {
+        WCHAR* a = argv[i];
+        if (!_wcsicmp(a, L"--listen")) {
+            if (i + 1 >= argc) return FALSE;
+            g.port = (USHORT)_wtoi(argv[++i]);
+            g.isHost = TRUE; haveMode = TRUE;
+        } else if (!_wcsicmp(a, L"--connect")) {
+            if (i + 1 >= argc) return FALSE;
+            {
+                WCHAR* s = argv[++i];
+                WCHAR* c = wcsrchr(s, L':');
+                char*  hp;
+                if (!c) return FALSE;
+                *c = L'\0';
+                hp = W2A(s);
+                if (!hp) return FALSE;
+                StringCchCopyA(g.peerHost, 128, hp);
+                FreeBuf(hp, (ULONG)(lstrlenA(hp) + 1));
+                g.port = (USHORT)_wtoi(c + 1);
+                *c = L':';
+            }
+            g.isHost = FALSE; haveMode = TRUE;
+        } else if (!_wcsicmp(a, L"--key")) {
+            char* hp;
+            if (i + 1 >= argc) return FALSE;
+            hp = W2A(argv[++i]);
+            if (!hp) return FALSE;
+            StringCchCopyA(g.key, CLIP_KEY_MAX, hp);
+            FreeBuf(hp, (ULONG)(lstrlenA(hp) + 1));
+        } else if (!_wcsicmp(a, L"--outdir")) {
+            if (i + 1 >= argc) return FALSE;
+            StringCchCopyW(g.outDir, MAX_PATH, argv[++i]);
+        } else if (!_wcsicmp(a, L"--max-file-mb")) {
+            if (i + 1 >= argc) return FALSE;
+            g.maxFileMb = (ULONG)_wtoi(argv[++i]);
+            if (!g.maxFileMb) g.maxFileMb = CLIP_MAX_FILE_DEFAULT_MB;
+        } else if (!_wcsicmp(a, L"--confirm-mb")) {
+            if (i + 1 >= argc) return FALSE;
+            g.confirmMb = (ULONG)_wtoi(argv[++i]);
+        } else if (!_wcsicmp(a, L"--quiet")) {
+            g.quiet = TRUE;
+        } else if (!_wcsicmp(a, L"--help")) {
+            return FALSE;
+        } else {
+            printf("[!] unknown option\n");
+            return FALSE;
+        }
+    }
+    if (!haveMode || !g.port) return FALSE;
+    g.keyTag = ClipKeyTag(g.key);
+    return TRUE;
+}
+
+int wmain(int argc, WCHAR** argv)
+{
+    WSADATA wsa;
+    MSG     msg;
+    int     i;
+
+    g.sock = INVALID_SOCKET;
+
+    for (i = 1; i < argc; i++) {
+        if (!_wcsicmp(argv[i], L"--help")) {
+            PrintUsage();
+            return 0;
+        }
+    }
+    if (!ParseArgs(argc, argv)) {
+        PrintUsage();
+        return 1;
+    }
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        printf("[X] WSAStartup failed\n");
+        return 1;
+    }
+
+    ClipEnsureDir(g.outDir);
+    if (!GetTempPathW(MAX_PATH, g.tempDir))
+        StringCchCopyW(g.tempDir, MAX_PATH, L"C:\\Windows\\Temp");
+
+    if (!UiInit(GetModuleHandleW(NULL))) {
+        printf("[X] UI init failed\n");
+        WSACleanup();
+        return 1;
+    }
+    if (g.quiet) UiShowLog(FALSE);
+    SweepStaleFiles(TRUE);
+    Log(LOG_OK, "ClipAgent %s mode, key=%s, outdir=%S",
+        g.isHost ? "HOST" : "GUEST", g.key, g.outDir);
+
+    InterlockedExchange(&g.netRunning, 1);
+    g.hNetThread = CreateThread(NULL, 0, NetThread, NULL, 0, NULL);
+    if (!g.hNetThread) {
+        Log(LOG_ERR, "CreateThread(net) failed");
+        InterlockedExchange(&g.netRunning, 0);
+    }
+
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    InterlockedExchange(&g.netRunning, 0);
+    if (g.hNetThread) {
+        WaitForSingleObject(g.hNetThread, 3000);
+        CloseHandle(g.hNetThread);
+        g.hNetThread = NULL;
+    }
+    if (g.state == CLIP_TRANSFER || g.state == CLIP_PAUSED)
+        CleanupTransfer(CLIP_R_USER_CANCEL, FALSE);
+    SweepStaleFiles(TRUE);
+    UiShutdown();
+    WSACleanup();
+    return 0;
+}
